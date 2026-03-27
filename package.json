@@ -4,33 +4,33 @@
   "type": "module",
   "private": true,
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./cors": "./src/cors.js",
+    "./validate": "./src/validate.js",
     "./http-server.config": "./src/http-server.config.js"
   },
   "scripts": {
     "build": "bun scripts/build-native.mjs",
     "build:release": "bun scripts/build-native.mjs --release",
-    "build:old:release": "cargo build --release --manifest-path old/native/Cargo.toml",
     "test": "bun run build && bun test/test.js",
-    "bench:ci": "bun bench/ci.js",
-    "bench": "bun run build:release && cargo build --release --manifest-path old/native/Cargo.toml && bun bench/run.js",
+    "bench": "bun run build:release && bun bench/run.js",
     "bench:http-native:static": "bun run build:release && bun bench/run.js http-native static 3001",
     "bench:bun:static": "bun bench/run.js bun static 3000",
     "bench:xitca:static": "bun bench/run.js xitca static 3003",
     "bench:monoio:static": "bun bench/run.js monoio static 3004",
     "bench:zig:static": "bun bench/run.js zig static 3005",
-    "bench:old:static": "cargo build --release --manifest-path old/native/Cargo.toml && bun bench/run.js old static 3002",
     "bench:http-native:dynamic": "bun run build:release && bun bench/run.js http-native dynamic 3011",
     "bench:bun:dynamic": "bun bench/run.js bun dynamic 3010",
     "bench:xitca:dynamic": "bun bench/run.js xitca dynamic 3013",
     "bench:monoio:dynamic": "bun bench/run.js monoio dynamic 3014",
     "bench:zig:dynamic": "bun bench/run.js zig dynamic 3015",
-    "bench:old:dynamic": "cargo build --release --manifest-path old/native/Cargo.toml && bun bench/run.js old dynamic 3012",
     "bench:http-native:opt": "bun run build:release && bun bench/run.js http-native opt 3021",
     "bench:bun:opt": "bun bench/run.js bun opt 3020",
     "bench:xitca:opt": "bun bench/run.js xitca opt 3023",
     "bench:monoio:opt": "bun bench/run.js monoio opt 3024",
-    "bench:zig:opt": "bun bench/run.js zig opt 3025",
-    "bench:old:opt": "cargo build --release --manifest-path old/native/Cargo.toml && bun bench/run.js old opt 3022"
+    "bench:zig:opt": "bun bench/run.js zig opt 3025"
   }
 }

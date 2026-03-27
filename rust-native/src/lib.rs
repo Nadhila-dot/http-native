@@ -4,7 +4,7 @@ mod router;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use memchr::{memchr, memmem};
+use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 use napi::bindgen_prelude::{Buffer, Function, Promise};
@@ -12,12 +12,15 @@ use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Error, Status};
 use napi_derive::napi;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use crate::manifest::{HttpServerConfigInput, ManifestInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
+
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const FALLBACK_DEFAULT_HOST: &str = "127.0.0.1";
 const FALLBACK_DEFAULT_BACKLOG: i32 = 2048;
@@ -29,9 +32,57 @@ const FALLBACK_HEADER_CONTENT_LENGTH_PREFIX: &str = "content-length:";
 const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
 const BRIDGE_VERSION: u8 = 1;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
+const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
 const NOT_FOUND_BODY: &[u8] = br#"{"error":"Route not found"}"#;
 
+/// Security: Maximum number of headers we allow per request
+const MAX_HEADER_COUNT: usize = 64;
+/// Security: Maximum URL length to prevent abuse
+const MAX_URL_LENGTH: usize = 8192;
+/// Security: Maximum single header value length
+const MAX_HEADER_VALUE_LENGTH: usize = 8192;
+/// Security: Maximum request body size (1 MB)
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Buffer pool: initial capacity for connection read buffers
+const BUFFER_INITIAL_CAPACITY: usize = 8192;
+/// Buffer pool: max buffers held per thread
+const BUFFER_POOL_MAX_SIZE: usize = 256;
+/// Buffer pool: max buffer size to recycle (don't recycle oversized buffers)
+const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
+
 type DispatchTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, Status, false, false, 0>;
+
+// ─── Thread-Local Buffer Pool ─────────────────────────────────────────────────
+//
+// Eliminates per-connection Vec<u8> allocations by recycling buffers.
+
+thread_local! {
+    static BUFFER_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(BUFFER_POOL_MAX_SIZE));
+}
+
+fn acquire_buffer() -> Vec<u8> {
+    BUFFER_POOL.with(|pool| {
+        pool.borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(BUFFER_INITIAL_CAPACITY))
+    })
+}
+
+fn release_buffer(mut buf: Vec<u8>) {
+    if buf.capacity() > BUFFER_POOL_MAX_RECYCLE_SIZE {
+        return; // Don't recycle oversized buffers
+    }
+    buf.clear();
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < BUFFER_POOL_MAX_SIZE {
+            pool.push(buf);
+        }
+    });
+}
+
+// ─── Server Configuration ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct HttpServerConfig {
@@ -108,6 +159,8 @@ impl HttpServerConfig {
         })
     }
 }
+
+// ─── NAPI Interface ───────────────────────────────────────────────────────────
 
 #[napi(object)]
 pub struct NativeListenOptions {
@@ -305,6 +358,8 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
         .unwrap_or(1)
 }
 
+// ─── JS Dispatcher ────────────────────────────────────────────────────────────
+
 struct JsDispatcher {
     callback: DispatchTsfn,
 }
@@ -322,6 +377,8 @@ impl JsDispatcher {
         Ok(response_json)
     }
 }
+
+// ─── Server Loop ──────────────────────────────────────────────────────────────
 
 async fn run_server(
     listener: TcpListener,
@@ -341,10 +398,8 @@ async fn run_server(
                     break;
                 }
 
-                if should_enable_nodelay() {
-                    if let Err(error) = stream.set_nodelay(true) {
-                        eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
-                    }
+                if let Err(error) = stream.set_nodelay(true) {
+                    eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
                 }
 
                 let router = Arc::clone(&router);
@@ -372,90 +427,214 @@ async fn run_server(
     Ok(())
 }
 
+// ─── Parsed Request (from httparse) ───────────────────────────────────────────
+
+struct ParsedRequest<'a> {
+    method: &'a [u8],
+    target: &'a [u8],
+    path: &'a [u8],
+    keep_alive: bool,
+    header_bytes: usize,
+    has_body: bool,
+    content_length: Option<usize>,
+    /// Pre-parsed header pairs — stored once, used by both routing and bridge
+    headers: Vec<(&'a str, &'a str)>,
+}
+
+// ─── Connection Handler with Buffer Pool ──────────────────────────────────────
+
 async fn handle_connection(
     mut stream: TcpStream,
     router: Arc<Router>,
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
 ) -> Result<()> {
-    let mut buffer: Vec<u8> = Vec::with_capacity(8192);
-    let mut buffer_start = 0usize;
+    let mut buffer = acquire_buffer();
 
+    let result = handle_connection_inner(
+        &mut stream,
+        &mut buffer,
+        &router,
+        &dispatcher,
+        &server_config,
+    )
+    .await;
+
+    release_buffer(buffer);
+    result
+}
+
+async fn handle_connection_inner(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    router: &Router,
+    dispatcher: &JsDispatcher,
+    server_config: &HttpServerConfig,
+) -> Result<()> {
     loop {
-        let request_head = loop {
-            let readable = &buffer[buffer_start..];
-            let request_head = if router.exact_get_root().is_some() {
-                parse_hot_root_request_head(readable, server_config.as_ref())
-                    .or_else(|| parse_request_head(readable))
+        // Try hot-path parsing first (GET / with known prefix)
+        let parsed = loop {
+            let result = if router.exact_get_root().is_some() {
+                parse_hot_root_request(buffer, server_config)
+                    .or_else(|| parse_request_httparse(buffer))
             } else {
-                parse_request_head(readable)
+                parse_request_httparse(buffer)
             };
 
-            if let Some(request_head) = request_head {
-                break request_head;
+            if let Some(parsed) = result {
+                break parsed;
             }
 
-            if find_header_end(readable).is_some() {
+            if find_header_end(buffer).is_some() {
+                // Headers complete but couldn't parse — malformed request
                 stream.shutdown().await?;
                 return Ok(());
             }
 
-            compact_read_buffer(&mut buffer, &mut buffer_start);
-            let (read_result, next_buffer) = stream.read(buffer).await;
-            buffer = next_buffer;
+            // SAFETY: We take ownership of the buffer, read into it, then put it back
+            let owned_buf = std::mem::take(buffer);
+            let (read_result, next_buffer) = stream.read(owned_buf).await;
+            *buffer = next_buffer;
             let bytes_read = read_result?;
 
             if bytes_read == 0 {
                 return Ok(());
             }
 
-            if buffer.len().saturating_sub(buffer_start) > server_config.max_header_bytes {
+            if buffer.len() > server_config.max_header_bytes {
+                // Security: Request header too large
+                let response = build_error_response_bytes(
+                    431,
+                    b"{\"error\":\"Request Header Fields Too Large\"}",
+                    false,
+                );
+                let (write_result, _) = stream.write_all(response).await;
+                write_result?;
                 stream.shutdown().await?;
                 return Ok(());
             }
         };
 
-        if request_head.has_body {
-            stream.shutdown().await?;
-            return Ok(());
+        let header_bytes = parsed.header_bytes;
+        let keep_alive = parsed.keep_alive;
+        let has_body = parsed.has_body;
+        let content_length = parsed.content_length;
+
+        // Extract owned copies from parsed (which borrows buffer) before we mutate buffer
+        let method_owned: Vec<u8> = parsed.method.to_vec();
+        let target_owned: Vec<u8> = parsed.target.to_vec();
+        let path_owned: Vec<u8> = parsed.path.to_vec();
+        let headers_owned: Vec<(String, String)> = parsed
+            .headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+
+        drop(parsed);
+
+        // ── Fast path: static routes (GET /) ──
+        if !has_body && method_owned == b"GET" {
+            if path_owned == b"/" {
+                if let Some(static_route) = router.exact_get_root() {
+                    drain_consumed_bytes(buffer, header_bytes);
+                    write_exact_static_response(stream, static_route, keep_alive).await?;
+                    if !keep_alive {
+                        stream.shutdown().await?;
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+            if let Some(static_route) = router.exact_static_route(&method_owned, &path_owned) {
+                drain_consumed_bytes(buffer, header_bytes);
+                write_exact_static_response(stream, static_route, keep_alive).await?;
+                if !keep_alive {
+                    stream.shutdown().await?;
+                    return Ok(());
+                }
+                continue;
+            }
         }
 
-        let header_bytes = request_head.header_bytes;
-        let keep_alive = request_head.keep_alive;
+        // ── Read request body if present ──────────────────────────────
+        let body_bytes: Vec<u8> = if has_body {
+            let content_length = match content_length {
+                Some(len) => len,
+                None => {
+                    // Chunked or unknown body length — reject for now
+                    let response =
+                        build_error_response_bytes(411, b"{\"error\":\"Length Required\"}", false);
+                    let (write_result, _) = stream.write_all(response).await;
+                    write_result?;
+                    stream.shutdown().await?;
+                    return Ok(());
+                }
+            };
 
-        if let Some(static_route) =
-            resolve_static_fast_path(&router, &request_head, server_config.as_ref())
-        {
-            consume_read_buffer(&mut buffer, &mut buffer_start, header_bytes);
-            write_exact_static_response(&mut stream, static_route, keep_alive).await?;
-
-            if !keep_alive {
+            // Security: enforce max body size
+            if content_length > MAX_BODY_BYTES {
+                let response =
+                    build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
+                let (write_result, _) = stream.write_all(response).await;
+                write_result?;
                 stream.shutdown().await?;
                 return Ok(());
             }
 
-            continue;
-        }
+            // Some body bytes may already be in the buffer after the headers
+            let already_in_buffer = if buffer.len() > header_bytes {
+                buffer.len() - header_bytes
+            } else {
+                0
+            };
 
-        let dispatch_request = build_manual_dispatch_request(
-            &router,
-            &buffer[buffer_start..buffer_start + header_bytes],
-            &request_head,
+            if already_in_buffer >= content_length {
+                // Entire body is already in the buffer
+                let body = buffer[header_bytes..header_bytes + content_length].to_vec();
+                drain_consumed_bytes(buffer, header_bytes + content_length);
+                body
+            } else {
+                // Need to read more bytes from the stream
+                let mut body = Vec::with_capacity(content_length);
+                if already_in_buffer > 0 {
+                    body.extend_from_slice(&buffer[header_bytes..]);
+                }
+                drain_consumed_bytes(buffer, buffer.len());
+
+                while body.len() < content_length {
+                    let remaining = content_length - body.len();
+                    let chunk_buf = vec![0u8; remaining.min(65536)];
+                    let (read_result, returned_buf) = stream.read(chunk_buf).await;
+                    let bytes_read = read_result?;
+                    if bytes_read == 0 {
+                        return Ok(()); // Connection closed mid-body
+                    }
+                    body.extend_from_slice(&returned_buf[..bytes_read]);
+                }
+                body.truncate(content_length);
+                body
+            }
+        } else {
+            drain_consumed_bytes(buffer, header_bytes);
+            Vec::new()
+        };
+
+        // Dynamic path: build bridge envelope and dispatch to JS
+        let dispatch_request = build_dispatch_request_owned(
+            router,
+            &method_owned,
+            &target_owned,
+            &path_owned,
+            &headers_owned,
+            &body_bytes,
         )?;
-        consume_read_buffer(&mut buffer, &mut buffer_start, header_bytes);
 
         match dispatch_request {
             Some(request) => {
-                write_dynamic_dispatch_response(
-                    &mut stream,
-                    dispatcher.as_ref(),
-                    request,
-                    keep_alive,
-                )
-                .await?;
+                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive).await?;
             }
             None => {
-                write_not_found_response(&mut stream, keep_alive).await?;
+                write_not_found_response(stream, keep_alive).await?;
             }
         }
 
@@ -466,185 +645,245 @@ async fn handle_connection(
     }
 }
 
-fn resolve_static_fast_path<'a>(
-    router: &'a Router,
-    request_head: &RequestHead<'_>,
-    server_config: &HttpServerConfig,
-) -> Option<&'a ExactStaticRoute> {
-    if request_head.path == b"/"
-        && request_head.method == b"GET"
-        && parse_hot_root_request_head_prefix(request_head, server_config)
-    {
-        return router.exact_get_root();
-    }
+// ─── httparse-based Request Parsing ───────────────────────────────────────────
+//
+// Uses the battle-tested `httparse` crate for RFC-compliant zero-copy parsing.
+// Single-pass: parses headers once and stores them for reuse by both the
+// router and the bridge envelope builder.
 
-    router.exact_static_route(request_head.method, request_head.path)
-}
+fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
+    let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
+    let mut req = httparse::Request::new(&mut raw_headers);
 
-fn parse_hot_root_request_head_prefix(
-    request_head: &RequestHead<'_>,
-    _server_config: &HttpServerConfig,
-) -> bool {
-    request_head.method == b"GET" && request_head.path == b"/"
-}
-
-fn compact_read_buffer(buffer: &mut Vec<u8>, buffer_start: &mut usize) {
-    if *buffer_start == 0 {
-        return;
-    }
-
-    if *buffer_start >= buffer.len() {
-        buffer.clear();
-        *buffer_start = 0;
-        return;
-    }
-
-    if *buffer_start < 4096 && buffer.len() < buffer.capacity() {
-        return;
-    }
-
-    let remaining = buffer.len() - *buffer_start;
-    buffer.copy_within(*buffer_start.., 0);
-    buffer.truncate(remaining);
-    *buffer_start = 0;
-}
-
-fn consume_read_buffer(buffer: &mut Vec<u8>, buffer_start: &mut usize, consumed: usize) {
-    *buffer_start = (*buffer_start).saturating_add(consumed);
-
-    if *buffer_start >= buffer.len() {
-        buffer.clear();
-        *buffer_start = 0;
-    }
-}
-
-fn bind_listener(
-    options: &NativeListenOptions,
-    server_config: &HttpServerConfig,
-) -> Result<TcpListener> {
-    let host = options
-        .host
-        .as_deref()
-        .unwrap_or(server_config.default_host.as_str());
-    let bind_addr = resolve_socket_addr(host, options.port)
-        .with_context(|| format!("failed to resolve bind address {host}:{}", options.port))?;
-    let mut listener_opts = ListenerOpts::new()
-        .reuse_addr(true)
-        .backlog(options.backlog.unwrap_or(server_config.default_backlog));
-    if worker_count_for(options) > 1 {
-        listener_opts = listener_opts.reuse_port(true);
-    }
-
-    TcpListener::bind_with_config(bind_addr, &listener_opts)
-        .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
-}
-
-fn should_enable_nodelay() -> bool {
-    std::env::var("HTTP_NATIVE_TCP_NODELAY")
-        .ok()
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(true)
-}
-
-fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
-    (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("unable to resolve {host}:{port}"))
-}
-
-fn validate_manifest(manifest: &ManifestInput) -> Result<()> {
-    if manifest.version != 1 {
-        return Err(anyhow!("Unsupported manifest version {}", manifest.version));
-    }
-
-    Ok(())
-}
-
-async fn write_exact_static_response(
-    stream: &mut TcpStream,
-    static_route: &ExactStaticRoute,
-    keep_alive: bool,
-) -> Result<()> {
-    let response = if keep_alive {
-        static_route.keep_alive_response.clone()
-    } else {
-        static_route.close_response.clone()
+    let header_len = match req.parse(bytes) {
+        Ok(httparse::Status::Complete(len)) => len,
+        Ok(httparse::Status::Partial) => return None,
+        Err(_) => return None, // Malformed — caller will handle
     };
 
-    let (write_result, _) = stream.write_all(response).await;
-    write_result?;
-    Ok(())
-}
+    let method = req.method?.as_bytes();
+    let target = req.path?.as_bytes();
+    let version = req.version?;
 
-#[derive(Clone)]
-struct DispatchResponseEnvelope {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Bytes,
-}
-
-fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
-    match method {
-        b"GET" => Some(1),
-        b"POST" => Some(2),
-        b"PUT" => Some(3),
-        b"DELETE" => Some(4),
-        b"PATCH" => Some(5),
-        b"OPTIONS" => Some(6),
-        b"HEAD" => Some(7),
-        _ => None,
+    // Security: enforce URL length limit
+    if target.len() > MAX_URL_LENGTH {
+        return None;
     }
+
+    // Extract path (before '?')
+    let path = target.split(|b| *b == b'?').next()?;
+
+    let mut keep_alive = version >= 1; // HTTP/1.1+ defaults to keep-alive
+    let mut has_body = false;
+    let mut content_length: Option<usize> = None;
+    let mut headers = Vec::with_capacity(req.headers.len());
+
+    for header in req.headers.iter() {
+        if header.name.is_empty() {
+            break;
+        }
+
+        // Security: enforce header value length
+        if header.value.len() > MAX_HEADER_VALUE_LENGTH {
+            return None;
+        }
+
+        let name = header.name; // httparse gives us &str
+        let value = match std::str::from_utf8(header.value) {
+            Ok(v) => v,
+            Err(_) => continue, // Skip non-UTF-8 headers
+        };
+
+        // Connection handling
+        if name.eq_ignore_ascii_case("connection") {
+            let lower = value.to_ascii_lowercase();
+            if lower.contains("close") {
+                keep_alive = false;
+            }
+            if lower.contains("keep-alive") {
+                keep_alive = true;
+            }
+        }
+
+        // Body detection
+        if name.eq_ignore_ascii_case("content-length") {
+            let trimmed = value.trim();
+            if let Ok(len) = trimmed.parse::<usize>() {
+                content_length = Some(len);
+                if len > 0 {
+                    has_body = true;
+                }
+            }
+        }
+
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity") {
+                has_body = true;
+            }
+        }
+
+        headers.push((name, value));
+    }
+
+    Some(ParsedRequest {
+        method,
+        target,
+        path,
+        keep_alive,
+        header_bytes: header_len,
+        has_body,
+        content_length,
+        headers,
+    })
 }
 
-fn build_manual_dispatch_request(
+// ─── Hot Root Path (GET /) ────────────────────────────────────────────────────
+//
+// Ultra-fast path for the most common benchmark case. Falls back to httparse
+// if the request doesn't exactly match the expected prefix.
+
+fn parse_hot_root_request(
+    bytes: &[u8],
+    server_config: &HttpServerConfig,
+) -> Option<ParsedRequest<'static>> {
+    let (_, keep_alive) = if bytes.starts_with(server_config.hot_get_root_http11.as_slice()) {
+        (server_config.hot_get_root_http11.len(), true)
+    } else if bytes.starts_with(server_config.hot_get_root_http10.as_slice()) {
+        (server_config.hot_get_root_http10.len(), false)
+    } else {
+        return None;
+    };
+
+    let header_end = find_header_end(bytes)?;
+    let mut keep_alive = keep_alive;
+    let mut has_body = false;
+    let mut line_start = bytes.iter().position(|b| *b == b'\n')? + 1;
+
+    while line_start + 2 <= header_end {
+        let next_end = memmem::find(&bytes[line_start..header_end + 2], b"\r\n")? + line_start;
+
+        if next_end == line_start {
+            break;
+        }
+
+        let line = &bytes[line_start..next_end];
+        if line.len() >= server_config.header_connection_prefix.len()
+            && line[..server_config.header_connection_prefix.len()]
+                .eq_ignore_ascii_case(server_config.header_connection_prefix.as_slice())
+        {
+            let value = &line[server_config.header_connection_prefix.len()..];
+            if contains_ascii_case_insensitive(value, b"close") {
+                keep_alive = false;
+            }
+            if contains_ascii_case_insensitive(value, b"keep-alive") {
+                keep_alive = true;
+            }
+        } else if line.len() >= server_config.header_content_length_prefix.len()
+            && line[..server_config.header_content_length_prefix.len()]
+                .eq_ignore_ascii_case(server_config.header_content_length_prefix.as_slice())
+        {
+            let value =
+                trim_ascii_spaces(&line[server_config.header_content_length_prefix.len()..]);
+            if value != b"0" {
+                has_body = true;
+            }
+        } else if line.len() >= server_config.header_transfer_encoding_prefix.len()
+            && line[..server_config.header_transfer_encoding_prefix.len()]
+                .eq_ignore_ascii_case(server_config.header_transfer_encoding_prefix.as_slice())
+        {
+            let value =
+                trim_ascii_spaces(&line[server_config.header_transfer_encoding_prefix.len()..]);
+            if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
+                has_body = true;
+            }
+        }
+
+        line_start = next_end + 2;
+    }
+
+    Some(ParsedRequest {
+        method: b"GET",
+        target: b"/",
+        path: b"/",
+        keep_alive,
+        header_bytes: header_end + 4,
+        has_body,
+        content_length: None,
+        headers: Vec::new(), // Hot path: no headers needed for static response
+    })
+}
+
+// ─── Routing ──────────────────────────────────────────────────────────────────
+
+// ─── Bridge Envelope Building (Single-Pass Headers) ───────────────────────────
+//
+// Uses the pre-parsed headers from httparse — no second scan of the raw bytes.
+
+fn build_dispatch_request_owned(
     router: &Router,
-    request_bytes: &[u8],
-    request_head: &RequestHead<'_>,
+    method: &[u8],
+    target: &[u8],
+    path: &[u8],
+    headers: &[(String, String)],
+    body: &[u8],
 ) -> Result<Option<Buffer>> {
-    let Some(method_code) = method_code_from_bytes(request_head.method) else {
+    let Some(method_code) = method_code_from_bytes(method) else {
         return Ok(None);
     };
 
-    let path = match std::str::from_utf8(request_head.path) {
-        Ok(path) => path,
+    let path_str = match std::str::from_utf8(path) {
+        Ok(path_str) => path_str,
         Err(_) => return Ok(None),
     };
-    let url = match std::str::from_utf8(request_head.target) {
-        Ok(url) => url,
+    let url_str = match std::str::from_utf8(target) {
+        Ok(url_str) => url_str,
         Err(_) => return Ok(None),
     };
-    let normalized_path = normalize_runtime_path(path);
+
+    // Security: strict path validation
+    let normalized_path = normalize_runtime_path(path_str);
+    if contains_path_traversal(&normalized_path) {
+        return Ok(None);
+    }
+
     let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
         return Ok(None);
     };
 
-    let header_entries = if matched_route.full_headers || !matched_route.header_keys.is_empty() {
-        parse_request_header_pairs(request_bytes)?
-    } else {
-        Vec::new()
-    };
-    build_dispatch_request_from_pairs(&matched_route, method_code, path, url, &header_entries)
-        .map(Some)
+    let header_refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+
+    build_dispatch_envelope(
+        &matched_route,
+        method_code,
+        path_str,
+        url_str,
+        &header_refs,
+        body,
+    )
+    .map(Some)
 }
 
-fn build_dispatch_request_from_pairs(
+fn build_dispatch_envelope(
     matched_route: &MatchedRoute<'_, '_>,
     method_code: u8,
     path: &str,
     url: &str,
     header_entries: &[(&str, &str)],
+    body: &[u8],
 ) -> Result<Buffer> {
     let url_bytes = url.as_bytes();
     let path_bytes = path.as_bytes();
-    let flags = if url.contains('?') {
-        REQUEST_FLAG_QUERY_PRESENT
-    } else {
-        0
-    };
+    let mut flags: u16 = 0;
+    if url.contains('?') {
+        flags |= REQUEST_FLAG_QUERY_PRESENT;
+    }
+    if !body.is_empty() {
+        flags |= REQUEST_FLAG_BODY_PRESENT;
+    }
 
     if url_bytes.len() > u32::MAX as usize {
         return Err(anyhow!("request url too large"));
@@ -660,8 +899,9 @@ fn build_dispatch_request_from_pairs(
         return Err(anyhow!("too many headers"));
     }
 
-    let mut frame =
-        Vec::with_capacity(16 + url_bytes.len() + path_bytes.len() + selected_headers.len() * 16);
+    let mut frame = Vec::with_capacity(
+        20 + url_bytes.len() + path_bytes.len() + selected_headers.len() * 16 + body.len(),
+    );
     frame.push(BRIDGE_VERSION);
     frame.push(method_code);
     push_u16(&mut frame, flags);
@@ -670,6 +910,7 @@ fn build_dispatch_request_from_pairs(
     push_u16(&mut frame, path_bytes.len() as u16);
     push_u16(&mut frame, matched_route.param_values.len() as u16);
     push_u16(&mut frame, selected_headers.len() as u16);
+    push_u32(&mut frame, body.len() as u32); // NEW: body length
     frame.extend_from_slice(url_bytes);
     frame.extend_from_slice(path_bytes);
 
@@ -680,6 +921,8 @@ fn build_dispatch_request_from_pairs(
     for (name, value) in selected_headers {
         push_string_pair(&mut frame, name, value)?;
     }
+
+    frame.extend_from_slice(body); // NEW: body bytes at end
 
     Ok(Buffer::from(frame))
 }
@@ -710,6 +953,179 @@ fn select_header_entries<'a>(
     selected
 }
 
+// ─── Response Writing ─────────────────────────────────────────────────────────
+
+async fn write_exact_static_response(
+    stream: &mut TcpStream,
+    static_route: &ExactStaticRoute,
+    keep_alive: bool,
+) -> Result<()> {
+    let response = if keep_alive {
+        static_route.keep_alive_response.clone()
+    } else {
+        static_route.close_response.clone()
+    };
+
+    let (write_result, _) = stream.write_all(response).await;
+    write_result?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct DispatchResponseEnvelope {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+}
+
+async fn write_dynamic_dispatch_response(
+    stream: &mut TcpStream,
+    dispatcher: &JsDispatcher,
+    request: Buffer,
+    keep_alive: bool,
+) -> Result<()> {
+    let parsed = match dispatcher.dispatch(request).await {
+        Ok(response) => match parse_dispatch_response(response.as_ref()) {
+            Ok(parsed) => parsed,
+            Err(_) => DispatchResponseEnvelope {
+                status: 500,
+                headers: vec![(
+                    "content-type".to_string(),
+                    "application/json; charset=utf-8".to_string(),
+                )],
+                // Security: sanitized error — no internal details
+                body: Bytes::from_static(b"{\"error\":\"Internal Server Error\"}"),
+            },
+        },
+        Err(_) => DispatchResponseEnvelope {
+            status: 502,
+            headers: vec![(
+                "content-type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            )],
+            // Security: sanitized error — no internal details
+            body: Bytes::from_static(b"{\"error\":\"Bad Gateway\"}"),
+        },
+    };
+
+    let response_bytes = build_dispatch_response_bytes(parsed, keep_alive);
+    let (write_result, _) = stream.write_all(response_bytes).await;
+    write_result?;
+    Ok(())
+}
+
+async fn write_not_found_response(stream: &mut TcpStream, keep_alive: bool) -> Result<()> {
+    let response = build_response_bytes(
+        404,
+        &[(
+            "content-type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )],
+        Bytes::from_static(NOT_FOUND_BODY),
+        keep_alive,
+    );
+    let (write_result, _) = stream.write_all(response).await;
+    write_result?;
+    Ok(())
+}
+
+/// Build a simple error response without going through the JS bridge
+fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec<u8> {
+    build_response_bytes(
+        status,
+        &[(
+            "content-type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )],
+        Bytes::copy_from_slice(body),
+        keep_alive,
+    )
+}
+
+fn build_dispatch_response_bytes(response: DispatchResponseEnvelope, keep_alive: bool) -> Vec<u8> {
+    build_response_bytes(
+        response.status,
+        &response.headers,
+        response.body,
+        keep_alive,
+    )
+}
+
+/// Optimized response builder: pre-calculates size and writes in a single pass
+fn build_response_bytes(
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+    keep_alive: bool,
+) -> Vec<u8> {
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let body_len = body.len();
+
+    // Pre-calculate total size to avoid reallocations
+    // "HTTP/1.1 " + status(3) + " " + reason + "\r\n" + "content-length: " + digits + "\r\n" + "connection: " + conn + "\r\n"
+    let mut total_size =
+        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        // Security: skip headers with CRLF injection
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        total_size += name.len() + 2 + value.len() + 2;
+    }
+
+    total_size += 2 + body_len; // final \r\n + body
+
+    let mut output = Vec::with_capacity(total_size);
+
+    // Status line
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Mandatory headers
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, body_len);
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // User headers
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(body.as_ref());
+    output
+}
+
+// ─── Response Parsing (from JS bridge) ────────────────────────────────────────
+
 fn parse_dispatch_response(bytes: &[u8]) -> Result<DispatchResponseEnvelope> {
     let mut offset = 0;
     let status = read_u16(bytes, &mut offset)?;
@@ -737,127 +1153,146 @@ fn parse_dispatch_response(bytes: &[u8]) -> Result<DispatchResponseEnvelope> {
     })
 }
 
-fn parse_request_header_pairs(bytes: &[u8]) -> Result<Vec<(&str, &str)>> {
-    let header_end = find_header_end(bytes).ok_or_else(|| anyhow!("request header incomplete"))?;
-    let line_end =
-        memmem::find(bytes, b"\r\n").ok_or_else(|| anyhow!("request line incomplete"))?;
-    let mut line_start = line_end + 2;
-    let mut headers = Vec::new();
+// ─── Security Utilities ───────────────────────────────────────────────────────
 
-    while line_start + 2 <= header_end {
-        let next_end = memmem::find(&bytes[line_start..header_end + 2], b"\r\n")
-            .ok_or_else(|| anyhow!("invalid header line"))?
-            + line_start;
+/// Check for path traversal attempts (../, ..\, etc.)
+fn contains_path_traversal(path: &str) -> bool {
+    // Decode percent-encoded dots
+    let decoded = path.replace("%2e", ".").replace("%2E", ".");
 
-        if next_end == line_start {
-            break;
+    // Check for traversal patterns
+    decoded.contains("/../")
+        || decoded.contains("\\..\\")
+        || decoded.ends_with("/..")
+        || decoded.ends_with("\\..")
+        || decoded.starts_with("../")
+        || decoded.starts_with("..\\")
+        || decoded == ".."
+}
+
+/// RFC 8259 compliant JSON string escaping — handles ALL control characters
+#[allow(dead_code)]
+pub(crate) fn escape_json(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\x08' => output.push_str("\\b"),
+            '\x0C' => output.push_str("\\f"),
+            c if c.is_control() => {
+                output.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => output.push(c),
         }
-
-        let line = &bytes[line_start..next_end];
-        let separator = memchr(b':', line).ok_or_else(|| anyhow!("invalid header separator"))?;
-        let name = std::str::from_utf8(&line[..separator]).context("header name was not utf-8")?;
-        let value = std::str::from_utf8(trim_ascii_spaces(&line[separator + 1..]))
-            .context("header value was not utf-8")?;
-        headers.push((name, value));
-        line_start = next_end + 2;
     }
-
-    Ok(headers)
-}
-
-async fn write_dynamic_dispatch_response(
-    stream: &mut TcpStream,
-    dispatcher: &JsDispatcher,
-    request: Buffer,
-    keep_alive: bool,
-) -> Result<()> {
-    let parsed = match dispatcher.dispatch(request).await {
-        Ok(response) => match parse_dispatch_response(response.as_ref()) {
-            Ok(parsed) => parsed,
-            Err(error) => DispatchResponseEnvelope {
-                status: 500,
-                headers: vec![(
-                    "content-type".to_string(),
-                    "application/json; charset=utf-8".to_string(),
-                )],
-                body: Bytes::from(format!(
-                    r#"{{"error":"Invalid response envelope","detail":"{}"}}"#,
-                    escape_json(error.to_string().as_str())
-                )),
-            },
-        },
-        Err(error) => DispatchResponseEnvelope {
-            status: 502,
-            headers: vec![(
-                "content-type".to_string(),
-                "application/json; charset=utf-8".to_string(),
-            )],
-            body: Bytes::from(format!(
-                r#"{{"error":"Dispatch failed","detail":"{}"}}"#,
-                escape_json(error.to_string().as_str())
-            )),
-        },
-    };
-
-    let response_bytes = build_dispatch_response_bytes(parsed, keep_alive);
-    let (write_result, _) = stream.write_all(response_bytes).await;
-    write_result?;
-    Ok(())
-}
-
-async fn write_not_found_response(stream: &mut TcpStream, keep_alive: bool) -> Result<()> {
-    let response = build_response_bytes(
-        404,
-        &[(
-            "content-type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        )],
-        Bytes::from_static(NOT_FOUND_BODY),
-        keep_alive,
-    );
-    let (write_result, _) = stream.write_all(response).await;
-    write_result?;
-    Ok(())
-}
-
-fn build_dispatch_response_bytes(response: DispatchResponseEnvelope, keep_alive: bool) -> Vec<u8> {
-    build_response_bytes(
-        response.status,
-        &response.headers,
-        response.body,
-        keep_alive,
-    )
-}
-
-fn build_response_bytes(
-    status: u16,
-    headers: &[(String, String)],
-    body: Bytes,
-    keep_alive: bool,
-) -> Vec<u8> {
-    let mut output = format!(
-        "HTTP/1.1 {} {}\r\ncontent-length: {}\r\nconnection: {}\r\n",
-        status,
-        status_reason(status),
-        body.len(),
-        if keep_alive { "keep-alive" } else { "close" }
-    )
-    .into_bytes();
-
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(b": ");
-        output.extend_from_slice(value.as_bytes());
-        output.extend_from_slice(b"\r\n");
-    }
-
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(body.as_ref());
     output
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
+    match method {
+        b"GET" => Some(1),
+        b"POST" => Some(2),
+        b"PUT" => Some(3),
+        b"DELETE" => Some(4),
+        b"PATCH" => Some(5),
+        b"OPTIONS" => Some(6),
+        b"HEAD" => Some(7),
+        _ => None,
+    }
+}
+
+fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
+    if consumed >= buffer.len() {
+        buffer.clear();
+        return;
+    }
+
+    let remaining = buffer.len() - consumed;
+    buffer.copy_within(consumed.., 0);
+    buffer.truncate(remaining);
+}
+
+fn bind_listener(
+    options: &NativeListenOptions,
+    server_config: &HttpServerConfig,
+) -> Result<TcpListener> {
+    let host = options
+        .host
+        .as_deref()
+        .unwrap_or(server_config.default_host.as_str());
+    let bind_addr = resolve_socket_addr(host, options.port)
+        .with_context(|| format!("failed to resolve bind address {host}:{}", options.port))?;
+    let listener_opts = ListenerOpts::new()
+        .reuse_addr(true)
+        .reuse_port(true)
+        .backlog(options.backlog.unwrap_or(server_config.default_backlog));
+
+    TcpListener::bind_with_config(bind_addr, &listener_opts)
+        .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
+}
+
+fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("unable to resolve {host}:{port}"))
+}
+
+fn validate_manifest(manifest: &ManifestInput) -> Result<()> {
+    if manifest.version != 1 {
+        return Err(anyhow!("Unsupported manifest version {}", manifest.version));
+    }
+
+    Ok(())
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    memmem::find(bytes, b"\r\n\r\n")
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn trim_ascii_spaces(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
+    if path == "/" || !path.ends_with('/') {
+        return Cow::Borrowed(path);
+    }
+
+    Cow::Owned(crate::analyzer::normalize_path(path))
+}
+
+fn config_string(
+    input: Option<&HttpServerConfigInput>,
+    pick: impl Fn(&HttpServerConfigInput) -> Option<&str>,
+    fallback: &str,
+) -> String {
+    input.and_then(pick).unwrap_or(fallback).to_string()
 }
 
 fn status_reason(status: u16) -> &'static str {
@@ -868,11 +1303,40 @@ fn status_reason(status: u16) -> &'static str {
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "OK",
     }
+}
+
+/// Fast integer-to-string for small values — uses stack-allocated itoa buffer
+#[inline(always)]
+fn write_usize(output: &mut Vec<u8>, value: usize) {
+    let mut buf = itoa::Buffer::new();
+    output.extend_from_slice(buf.format(value).as_bytes());
+}
+
+#[inline(always)]
+fn write_u16(output: &mut Vec<u8>, value: u16) {
+    let mut buf = itoa::Buffer::new();
+    output.extend_from_slice(buf.format(value).as_bytes());
+}
+
+fn count_digits(mut n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    while n > 0 {
+        count += 1;
+        n /= 10;
+    }
+    count
 }
 
 fn push_string_pair(frame: &mut Vec<u8>, name: &str, value: &str) -> Result<()> {
@@ -953,207 +1417,6 @@ fn read_utf8(bytes: &[u8], offset: &mut usize, length: usize) -> Result<String> 
         .to_string();
     *offset += length;
     Ok(value)
-}
-
-struct RequestHead<'a> {
-    method: &'a [u8],
-    target: &'a [u8],
-    path: &'a [u8],
-    keep_alive: bool,
-    header_bytes: usize,
-    has_body: bool,
-}
-
-fn parse_request_head(bytes: &[u8]) -> Option<RequestHead<'_>> {
-    let header_end = find_header_end(bytes)?;
-    let line_end = memmem::find(bytes, b"\r\n")?;
-    let request_line = &bytes[..line_end];
-
-    let first_space = memchr(b' ', request_line)?;
-    let second_space = memchr(b' ', &request_line[first_space + 1..])? + first_space + 1;
-
-    let method = &request_line[..first_space];
-    let target = &request_line[first_space + 1..second_space];
-    let version = &request_line[second_space + 1..];
-    let path = target.split(|byte| *byte == b'?').next()?;
-
-    let (keep_alive, has_body) = scan_header_controls(
-        bytes,
-        line_end + 2,
-        header_end,
-        version.eq_ignore_ascii_case(b"HTTP/1.1"),
-        b"connection:",
-        b"content-length:",
-        b"transfer-encoding:",
-    )?;
-
-    Some(RequestHead {
-        method,
-        target,
-        path,
-        keep_alive,
-        header_bytes: header_end + 4,
-        has_body,
-    })
-}
-
-fn parse_hot_root_request_head(
-    bytes: &[u8],
-    server_config: &HttpServerConfig,
-) -> Option<RequestHead<'static>> {
-    let (request_line_len, keep_alive) =
-        if bytes.starts_with(server_config.hot_get_root_http11.as_slice()) {
-            (server_config.hot_get_root_http11.len(), true)
-        } else if bytes.starts_with(server_config.hot_get_root_http10.as_slice()) {
-            (server_config.hot_get_root_http10.len(), false)
-        } else {
-            return None;
-        };
-
-    let header_end = find_header_end(bytes)?;
-    let (keep_alive, has_body) = scan_header_controls(
-        bytes,
-        request_line_len,
-        header_end,
-        keep_alive,
-        server_config.header_connection_prefix.as_slice(),
-        server_config.header_content_length_prefix.as_slice(),
-        server_config.header_transfer_encoding_prefix.as_slice(),
-    )?;
-
-    Some(RequestHead {
-        method: b"GET",
-        target: b"/",
-        path: b"/",
-        keep_alive,
-        header_bytes: header_end + 4,
-        has_body,
-    })
-}
-
-fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    memmem::find(bytes, b"\r\n\r\n")
-}
-
-fn scan_header_controls(
-    bytes: &[u8],
-    mut line_start: usize,
-    header_end: usize,
-    mut keep_alive: bool,
-    connection_prefix: &[u8],
-    content_length_prefix: &[u8],
-    transfer_encoding_prefix: &[u8],
-) -> Option<(bool, bool)> {
-    let mut has_body = false;
-
-    while line_start <= header_end {
-        let next_end = find_line_end(bytes, line_start, header_end)?;
-        if next_end == line_start {
-            break;
-        }
-
-        let line = &bytes[line_start..next_end];
-        match ascii_lowercase(line[0]) {
-            b'c' => {
-                if line.len() >= connection_prefix.len()
-                    && line[..connection_prefix.len()].eq_ignore_ascii_case(connection_prefix)
-                {
-                    let value = &line[connection_prefix.len()..];
-                    if contains_ascii_case_insensitive(value, b"close") {
-                        keep_alive = false;
-                    }
-                    if contains_ascii_case_insensitive(value, b"keep-alive") {
-                        keep_alive = true;
-                    }
-                } else if line.len() >= content_length_prefix.len()
-                    && line[..content_length_prefix.len()]
-                        .eq_ignore_ascii_case(content_length_prefix)
-                {
-                    let value = trim_ascii_spaces(&line[content_length_prefix.len()..]);
-                    if value != b"0" {
-                        has_body = true;
-                    }
-                }
-            }
-            b't' => {
-                if line.len() >= transfer_encoding_prefix.len()
-                    && line[..transfer_encoding_prefix.len()]
-                        .eq_ignore_ascii_case(transfer_encoding_prefix)
-                {
-                    let value = trim_ascii_spaces(&line[transfer_encoding_prefix.len()..]);
-                    if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
-                        has_body = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        line_start = next_end + 2;
-    }
-
-    Some((keep_alive, has_body))
-}
-
-fn find_line_end(bytes: &[u8], line_start: usize, header_end: usize) -> Option<usize> {
-    let relative_end = memchr(b'\r', &bytes[line_start..header_end + 2])?;
-    let line_end = line_start + relative_end;
-    if bytes.get(line_end + 1) != Some(&b'\n') {
-        return None;
-    }
-
-    Some(line_end)
-}
-
-fn ascii_lowercase(byte: u8) -> u8 {
-    if byte.is_ascii_uppercase() {
-        byte + 32
-    } else {
-        byte
-    }
-}
-
-fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
-fn trim_ascii_spaces(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
-        .unwrap_or(start);
-    &bytes[start..end]
-}
-
-fn config_string(
-    input: Option<&HttpServerConfigInput>,
-    pick: impl Fn(&HttpServerConfigInput) -> Option<&str>,
-    fallback: &str,
-) -> String {
-    input.and_then(pick).unwrap_or(fallback).to_string()
-}
-
-fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
-    if path == "/" || !path.ends_with('/') {
-        return Cow::Borrowed(path);
-    }
-
-    Cow::Owned(crate::analyzer::normalize_path(path))
-}
-
-fn escape_json(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn to_napi_error<E>(error: E) -> Error

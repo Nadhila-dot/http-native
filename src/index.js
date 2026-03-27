@@ -19,6 +19,8 @@ const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
 
+// ─── Path Normalization ───────────────────────────────────────────────────────
+
 function normalizePathPrefix(path) {
   if (path === "/") {
     return "/";
@@ -64,14 +66,45 @@ function normalizeContentType(type) {
   return type;
 }
 
-function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback")) {
-  const state = {
+// ─── Response Envelope (Pooled) ───────────────────────────────────────────────
+
+const RESPONSE_POOL_MAX = 512;
+const responsePool = [];
+
+function acquireResponseState() {
+  const pooled = responsePool.pop();
+  if (pooled) {
+    pooled.status = 200;
+    // Reset headers — use null-prototype object for security
+    for (const key in pooled.headers) {
+      delete pooled.headers[key];
+    }
+    pooled.body = EMPTY_BUFFER;
+    pooled.finished = false;
+    // Reset locals
+    for (const key in pooled.locals) {
+      delete pooled.locals[key];
+    }
+    return pooled;
+  }
+
+  return {
     status: 200,
-    headers: {},
+    headers: Object.create(null),
     body: EMPTY_BUFFER,
     finished: false,
-    locals: {},
+    locals: Object.create(null),
   };
+}
+
+function releaseResponseState(state) {
+  if (responsePool.length < RESPONSE_POOL_MAX) {
+    responsePool.push(state);
+  }
+}
+
+function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback")) {
+  const state = acquireResponseState();
 
   const response = {
     locals: state.locals,
@@ -86,7 +119,14 @@ function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback"
     },
 
     set(name, value) {
-      state.headers[String(name).toLowerCase()] = String(value);
+      // Security: validate header name/value for CRLF injection
+      const headerName = String(name).toLowerCase();
+      const headerValue = String(value);
+      if (headerName.includes("\r") || headerName.includes("\n") ||
+          headerValue.includes("\r") || headerValue.includes("\n")) {
+        return response; // Silently reject — security
+      }
+      state.headers[headerName] = headerValue;
       return response;
     },
 
@@ -161,10 +201,42 @@ function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback"
         body: state.body,
       };
     },
+    release() {
+      releaseResponseState(state);
+    },
   };
 }
 
+// ─── Compiled Middleware Runner ────────────────────────────────────────────────
+//
+// Generates an optimized runner that avoids function.length checks at runtime
+// by pre-classifying middlewares during compilation.
+
 function createMiddlewareRunner(middlewares) {
+  if (middlewares.length === 0) {
+    // Fast path: no middlewares — return a no-op
+    return async function noopMiddleware(_req, _res) {};
+  }
+
+  if (middlewares.length === 1) {
+    // Fast path: single middleware — avoid dispatch overhead
+    const mw = middlewares[0];
+    if (mw.handler.length >= 3) {
+      return async function runSingleMiddleware(req, res) {
+        await mw.handler(req, res, () => Promise.resolve());
+      };
+    }
+    return async function runSingleMiddleware(req, res) {
+      await mw.handler(req, res);
+    };
+  }
+
+  // Pre-classify each middleware as "next-aware" or "auto-advance"
+  const classified = middlewares.map((mw) => ({
+    handler: mw.handler,
+    needsNext: mw.handler.length >= 3,
+  }));
+
   return async function runCompiledMiddlewares(req, res) {
     let index = -1;
 
@@ -174,12 +246,12 @@ function createMiddlewareRunner(middlewares) {
       }
 
       index = position;
-      const middleware = middlewares[position];
+      const middleware = classified[position];
       if (!middleware || res.finished) {
         return;
       }
 
-      if (middleware.handler.length >= 3) {
+      if (middleware.needsNext) {
         await middleware.handler(req, res, () => dispatch(position + 1));
         return;
       }
@@ -194,23 +266,30 @@ function createMiddlewareRunner(middlewares) {
   };
 }
 
+// ─── Error Handling (Security-Hardened) ───────────────────────────────────────
+
 function serializeErrorResponse(error) {
+  // Security: NEVER leak internal error details to the client
+  const isProduction = process.env.NODE_ENV === "production";
+  const body = isProduction
+    ? { error: "Internal Server Error" }
+    : {
+        error: "Internal Server Error",
+        detail: error instanceof Error ? error.message : String(error),
+      };
+
   return encodeResponseEnvelope({
     status: 500,
     headers: {
       "content-type": "application/json; charset=utf-8",
     },
-    body: Buffer.from(
-      JSON.stringify({
-        error: "Internal Server Error",
-        detail: error instanceof Error ? error.message : String(error),
-      }),
-      "utf8",
-    ),
+    body: Buffer.from(JSON.stringify(body), "utf8"),
   });
 }
 
-function createDispatcher(compiledRoutes, runtimeOptimizer) {
+// ─── Dispatcher ───────────────────────────────────────────────────────────────
+
+function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
 
   return async function dispatch(requestBuffer) {
@@ -228,7 +307,7 @@ function createDispatcher(compiledRoutes, runtimeOptimizer) {
     }
 
     const req = route.requestFactory(decoded);
-    const { response: res, snapshot } = createResponseEnvelope(route.jsonSerializer);
+    const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
 
     try {
       await route.runMiddlewares(req, res);
@@ -237,15 +316,37 @@ function createDispatcher(compiledRoutes, runtimeOptimizer) {
       }
     } catch (error) {
       if (!res.finished) {
-        return serializeErrorResponse(error);
+        // Try registered error handlers first
+        for (const errorHandler of errorHandlers) {
+          try {
+            await errorHandler(error, req, res);
+            if (res.finished) {
+              break;
+            }
+          } catch (handlerError) {
+            // Error handler itself threw — fall through to default
+            release();
+            return serializeErrorResponse(handlerError);
+          }
+        }
+
+        // If no error handler responded, use default
+        if (!res.finished) {
+          release();
+          return serializeErrorResponse(error);
+        }
       }
     }
 
     const responseSnapshot = snapshot();
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
-    return encodeResponseEnvelope(responseSnapshot);
+    const encoded = encodeResponseEnvelope(responseSnapshot);
+    release();
+    return encoded;
   };
 }
+
+// ─── Route Registration & Compilation ─────────────────────────────────────────
 
 function normalizeRouteRegistration(method, path, handler) {
   if (typeof handler !== "function") {
@@ -334,6 +435,8 @@ function normalizeListenOptions(options = {}) {
   };
 }
 
+// ─── Application Factory ─────────────────────────────────────────────────────
+
 export function createApp() {
   const native = loadNativeModule();
   let nextHandlerId = 1;
@@ -341,6 +444,7 @@ export function createApp() {
   const app = {
     _routes: [],
     _middlewares: [],
+    _errorHandlers: [],
 
     use(pathOrMiddleware, maybeMiddleware) {
       let pathPrefix = "/";
@@ -356,6 +460,14 @@ export function createApp() {
       }
 
       this._middlewares.push({ pathPrefix, handler });
+      return this;
+    },
+
+    onError(handler) {
+      if (typeof handler !== "function") {
+        throw new TypeError("Error handler must be a function");
+      }
+      this._errorHandlers.push(handler);
       return this;
     },
 
@@ -411,7 +523,7 @@ export function createApp() {
         compiledMiddlewares,
         normalizedOptions.opt,
       );
-      const dispatcher = createDispatcher(compiledRoutes, runtimeOptimizer);
+      const dispatcher = createDispatcher(compiledRoutes, runtimeOptimizer, this._errorHandlers);
       const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
         host: normalizedOptions.host,
         port: normalizedOptions.port,

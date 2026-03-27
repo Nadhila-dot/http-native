@@ -7,6 +7,7 @@ const EMPTY_ARRAY = Object.freeze([]);
 
 export const BRIDGE_VERSION = 1;
 export const REQUEST_FLAG_QUERY_PRESENT = 1 << 0;
+export const REQUEST_FLAG_BODY_PRESENT = 1 << 1;
 
 export const METHOD_CODES = Object.freeze({
   GET: 1,
@@ -23,15 +24,42 @@ export const ROUTE_KIND = Object.freeze({
   PARAM: 2,
 });
 
-const EMPTY_OBJECT = Object.freeze({});
+// Security: use null-prototype objects for user-facing data to prevent prototype pollution
+const EMPTY_OBJECT = Object.freeze(Object.create(null));
+
+// ─── Regex patterns for source analysis ───────────────────────────────────────
 
 const PARAM_DOT_RE = /\breq\.params\.([A-Za-z_$][\w$]*)\b/g;
-const PARAM_BRACKET_RE = /\breq\.params\[(["'])([^"'\\]+)\1\]/g;
+const PARAM_BRACKET_RE = /\breq\.params\[(['"])([^"'\\]+)\1\]/g;
 const QUERY_DOT_RE = /\breq\.query\.([A-Za-z_$][\w$]*)\b/g;
-const QUERY_BRACKET_RE = /\breq\.query\[(["'])([^"'\\]+)\1\]/g;
+const QUERY_BRACKET_RE = /\breq\.query\[(['"])([^"'\\]+)\1\]/g;
 const HEADER_DOT_RE = /\breq\.headers\.([A-Za-z_$][\w$]*)\b/g;
-const HEADER_BRACKET_RE = /\breq\.headers\[(["'])([^"'\\]+)\1\]/g;
-const HEADER_CALL_RE = /\breq\.header\((["'])([^"'\\]+)\1\)/g;
+const HEADER_BRACKET_RE = /\breq\.headers\[(['"])([^"'\\]+)\1\]/g;
+const HEADER_CALL_RE = /\breq\.header\((['"])([^"'\\]+)\1\)/g;
+
+// Pre-compiled patterns for full-access detection (using RegExp constructor to avoid escaping issues)
+const PARAMS_FULL_ACCESS_RE = new RegExp('\\breq\\.params\\b(?!\\s*(?:\\.|\\[))');
+const PARAMS_DYN_BRACKET_RE = new RegExp("\\breq\\.params\\[(?!['\"])");
+const QUERY_FULL_ACCESS_RE = new RegExp('\\breq\\.query\\b(?!\\s*(?:\\.|\\[))');
+const QUERY_DYN_BRACKET_RE = new RegExp("\\breq\\.query\\[(?!['\"])");
+const HEADERS_FULL_ACCESS_RE = new RegExp('\\breq\\.headers\\b(?!\\s*(?:\\.|\\[))');
+const HEADERS_DYN_BRACKET_RE = new RegExp("\\breq\\.headers\\[(?!['\"])");
+const REQ_BRACKET_STR_RE = new RegExp("\\breq\\s*\\[(['\"])[^\"'\\\\]+\\1\\]");
+const REQ_BRACKET_DYN_RE = new RegExp("\\breq\\s*\\[(?!['\"])");
+const HEADER_CALL_DYN_RE = new RegExp("\\breq\\.header\\((?!['\"])");
+
+// Security: dangerous prototype keys that must never be allowed in user objects
+const DANGEROUS_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
+
+// ─── Route Compilation ────────────────────────────────────────────────────────
 
 export function compileRouteShape(method, path) {
   const methodCode = METHOD_CODES[method];
@@ -62,6 +90,8 @@ export function compileRouteShape(method, path) {
   };
 }
 
+// ─── Request Access Analysis ──────────────────────────────────────────────────
+
 export function analyzeRequestAccess(source) {
   const plan = createEmptyAccessPlan();
   const normalizedSource = String(source ?? "");
@@ -88,22 +118,22 @@ export function analyzeRequestAccess(source) {
   collectMatches(normalizedSource, HEADER_BRACKET_RE, plan.headerKeys, normalizeHeaderLookup, 2);
   collectMatches(normalizedSource, HEADER_CALL_RE, plan.headerKeys, normalizeHeaderLookup, 2);
 
-  if (/\breq\.params\b(?!\s*(?:\.|\[))/.test(normalizedSource) || /\breq\.params\[(?!["'])/.test(normalizedSource)) {
+  if (PARAMS_FULL_ACCESS_RE.test(normalizedSource) || PARAMS_DYN_BRACKET_RE.test(normalizedSource)) {
     plan.fullParams = true;
     plan.dispatchKind = "generic_fallback";
   }
 
-  if (/\breq\.query\b(?!\s*(?:\.|\[))/.test(normalizedSource) || /\breq\.query\[(?!["'])/.test(normalizedSource)) {
+  if (QUERY_FULL_ACCESS_RE.test(normalizedSource) || QUERY_DYN_BRACKET_RE.test(normalizedSource)) {
     plan.fullQuery = true;
     plan.dispatchKind = "generic_fallback";
   }
 
-  if (/\breq\.headers\b(?!\s*(?:\.|\[))/.test(normalizedSource) || /\breq\.headers\[(?!["'])/.test(normalizedSource)) {
+  if (HEADERS_FULL_ACCESS_RE.test(normalizedSource) || HEADERS_DYN_BRACKET_RE.test(normalizedSource)) {
     plan.fullHeaders = true;
     plan.dispatchKind = "generic_fallback";
   }
 
-  if (/\breq\s*\[(["'])[^"'\\]+\1\]/.test(normalizedSource) || /\breq\s*\[(?!["'])/.test(normalizedSource)) {
+  if (REQ_BRACKET_STR_RE.test(normalizedSource) || REQ_BRACKET_DYN_RE.test(normalizedSource)) {
     plan.method = true;
     plan.path = true;
     plan.url = true;
@@ -113,7 +143,7 @@ export function analyzeRequestAccess(source) {
     plan.dispatchKind = "generic_fallback";
   }
 
-  if (/\breq\.header\((?!["'])/.test(normalizedSource)) {
+  if (HEADER_CALL_DYN_RE.test(normalizedSource)) {
     plan.fullHeaders = true;
     plan.dispatchKind = "generic_fallback";
   }
@@ -152,112 +182,219 @@ export function mergeRequestAccessPlans(plans) {
   return freezeAccessPlan(merged);
 }
 
+// ─── Request Factory (with Object Pooling) ────────────────────────────────────
+
+// Pool for request objects — avoids per-request allocations
+const REQUEST_POOL_MAX = 512;
+const requestPool = [];
+
+function acquireRequestObject() {
+  return requestPool.pop() || null;
+}
+
+function releaseRequestObject(req) {
+  if (requestPool.length >= REQUEST_POOL_MAX) {
+    return;
+  }
+  // Reset all fields before pooling
+  req.method = "";
+  req._path = undefined;
+  req._url = undefined;
+  req._params = undefined;
+  req._query = undefined;
+  req._headers = undefined;
+  req._decoded = null;
+  req._routeParamNames = null;
+  req._plan = null;
+  req._routeMethod = null;
+  requestPool.push(req);
+}
+
+function createPooledRequest() {
+  const req = Object.create(null);
+
+  // Internal state
+  req._path = undefined;
+  req._url = undefined;
+  req._params = undefined;
+  req._query = undefined;
+  req._headers = undefined;
+  req._bodyParsed = undefined;
+  req._decoded = null;
+  req._routeParamNames = null;
+  req._plan = null;
+  req._routeMethod = null;
+  req.method = "";
+
+  Object.defineProperty(req, "path", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._path === undefined) {
+        req._path = textDecoder.decode(req._decoded.pathBytes);
+      }
+      return req._path;
+    },
+  });
+
+  Object.defineProperty(req, "url", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._url === undefined) {
+        req._url = textDecoder.decode(req._decoded.urlBytes);
+      }
+      return req._url;
+    },
+  });
+
+  Object.defineProperty(req, "params", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._params === undefined) {
+        const needsParams = req._plan.fullParams || req._plan.paramKeys.size > 0;
+        req._params = needsParams
+          ? materializeParamObject(req._decoded.paramValues, req._routeParamNames, req._plan)
+          : EMPTY_OBJECT;
+      }
+      return req._params;
+    },
+  });
+
+  Object.defineProperty(req, "query", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._query === undefined) {
+        const needsQuery = req._plan.fullQuery || req._plan.queryKeys.size > 0;
+        if (!needsQuery) {
+          req._query = EMPTY_OBJECT;
+        } else {
+          // Compute URL for query parsing
+          if (req._url === undefined) {
+            req._url = textDecoder.decode(req._decoded.urlBytes);
+          }
+          req._query = materializeQueryObject(req._url, req._decoded.flags, req._plan);
+        }
+      }
+      return req._query;
+    },
+  });
+
+  Object.defineProperty(req, "headers", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._headers === undefined) {
+        const needsHeaders = req._plan.fullHeaders || req._plan.headerKeys.size > 0;
+        req._headers = needsHeaders
+          ? materializeHeaderObject(req._decoded.rawHeaders, req._plan)
+          : EMPTY_OBJECT;
+      }
+      return req._headers;
+    },
+  });
+
+  req.header = function header(name) {
+    const lookup = normalizeHeaderLookup(name);
+    if (req._headers && lookup in req._headers) {
+      return req._headers[lookup];
+    }
+    if (req._decoded.rawHeaders.length === 0) {
+      return undefined;
+    }
+    return lookupHeaderValue(req._decoded.rawHeaders, lookup);
+  };
+
+  // ─── Body APIs ────────────────────────────────────────────────────────
+
+  Object.defineProperty(req, "body", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._decoded.bodyBytes === null) {
+        return null;
+      }
+      return Buffer.from(req._decoded.bodyBytes.buffer, req._decoded.bodyBytes.byteOffset, req._decoded.bodyBytes.byteLength);
+    },
+  });
+
+  req.json = function json() {
+    if (req._bodyParsed !== undefined) {
+      return req._bodyParsed;
+    }
+    if (req._decoded.bodyBytes === null || req._decoded.bodyBytes.length === 0) {
+      req._bodyParsed = null;
+      return null;
+    }
+    const text = textDecoder.decode(req._decoded.bodyBytes);
+    req._bodyParsed = JSON.parse(text);
+    return req._bodyParsed;
+  };
+
+  req.text = function text() {
+    if (req._decoded.bodyBytes === null || req._decoded.bodyBytes.length === 0) {
+      return "";
+    }
+    return textDecoder.decode(req._decoded.bodyBytes);
+  };
+
+  req.arrayBuffer = function arrayBuffer() {
+    if (req._decoded.bodyBytes === null) {
+      return new ArrayBuffer(0);
+    }
+    return req._decoded.bodyBytes.buffer.slice(
+      req._decoded.bodyBytes.byteOffset,
+      req._decoded.bodyBytes.byteOffset + req._decoded.bodyBytes.byteLength,
+    );
+  };
+
+  return req;
+}
+
 export function createRequestFactory(
   plan,
   routeParamNames = EMPTY_ARRAY,
   routeMethod = "GET",
 ) {
   return function buildRequest(decoded) {
-    const needsParams = plan.fullParams || plan.paramKeys.size > 0;
-    const needsQuery = plan.fullQuery || plan.queryKeys.size > 0;
-    const needsHeaders = plan.fullHeaders || plan.headerKeys.size > 0;
-
-    let path;
-    let url;
-    let params;
-    let query;
-    let headers;
-
-    function decodePath() {
-      if (path === undefined) {
-        path = textDecoder.decode(decoded.pathBytes);
-      }
-      return path;
+    let request = acquireRequestObject();
+    if (!request) {
+      request = createPooledRequest();
     }
 
-    function decodeUrl() {
-      if (url === undefined) {
-        url = textDecoder.decode(decoded.urlBytes);
-      }
-      return url;
-    }
-
-    const request = {
-      method: routeMethod,
-
-      get path() {
-        return decodePath();
-      },
-
-      get url() {
-        return decodeUrl();
-      },
-
-      get params() {
-        if (params === undefined) {
-          params = needsParams
-            ? materializeParamObject(decoded.paramValues, routeParamNames, plan)
-            : EMPTY_OBJECT;
-        }
-        return params;
-      },
-
-      get query() {
-        if (query === undefined) {
-          query = needsQuery
-            ? materializeQueryObject(decodeUrl(), decoded.flags, plan)
-            : EMPTY_OBJECT;
-        }
-        return query;
-      },
-
-      get headers() {
-        if (headers === undefined) {
-          headers = needsHeaders
-            ? materializeHeaderObject(decoded.rawHeaders, plan)
-            : EMPTY_OBJECT;
-        }
-        return headers;
-      },
-
-      header(name) {
-        const lookup = normalizeHeaderLookup(name);
-        if (headers && lookup in headers) {
-          return headers[lookup];
-        }
-        if (decoded.rawHeaders.length === 0) {
-          return undefined;
-        }
-        return lookupHeaderValue(decoded.rawHeaders, lookup);
-      },
-    };
+    // Initialize for this request
+    request._decoded = decoded;
+    request._routeParamNames = routeParamNames;
+    request._plan = plan;
+    request._routeMethod = routeMethod;
+    request.method = routeMethod;
+    request._path = undefined;
+    request._url = undefined;
+    request._params = undefined;
+    request._query = undefined;
+    request._headers = undefined;
+    request._bodyParsed = undefined;
 
     return request;
   };
 }
 
+// ─── JSON Serialization ───────────────────────────────────────────────────────
+
 export function createJsonSerializer(mode = "fallback") {
-  if (mode === "fallback") {
-    const serializer = (value) => {
-      const serialized = JSON.stringify(value);
-      return Buffer.from(serialized, "utf8");
-    };
-    serializer.kind = "fallback";
-    return serializer;
-  }
-
+  // Performance: V8's native JSON.stringify is heavily optimized and almost always
+  // faster than any JS-level reimplementation. Use it directly.
   const serializer = (value) => {
-    const fastValue = trySerializeJsonFast(value);
-    if (fastValue !== null) {
-      return Buffer.from(fastValue, "utf8");
-    }
-
     const serialized = JSON.stringify(value);
     return Buffer.from(serialized, "utf8");
   };
   serializer.kind = mode;
   return serializer;
 }
+
+// ─── Binary Protocol Codec ────────────────────────────────────────────────────
 
 export function decodeRequestEnvelope(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -284,6 +421,9 @@ export function decodeRequestEnvelope(buffer) {
   offset += 2;
   const headerCount = readU16(view, offset);
   offset += 2;
+
+  const bodyLength = readU32(view, offset);
+  offset += 4;
 
   const urlBytes = readBytes(bytes, offset, urlLength);
   offset += urlLength;
@@ -312,6 +452,10 @@ export function decodeRequestEnvelope(buffer) {
     rawHeaders[index] = [nameBytes, valueBytes];
   }
 
+  // Read body bytes
+  const bodyBytes = bodyLength > 0 ? readBytes(bytes, offset, bodyLength) : null;
+  offset += bodyLength;
+
   switch (methodCode) {
     case METHOD_CODES.GET:
     case METHOD_CODES.POST:
@@ -333,6 +477,7 @@ export function decodeRequestEnvelope(buffer) {
     pathBytes,
     paramValues,
     rawHeaders,
+    bodyBytes,
   };
 }
 
@@ -384,6 +529,10 @@ export function encodeResponseEnvelope(snapshot) {
   return output;
 }
 
+// ─── Object Materialization (Security-Hardened) ───────────────────────────────
+//
+// All user-facing objects use Object.create(null) to prevent prototype pollution.
+
 function materializeParamObject(entries, paramNames, plan) {
   if (plan.fullParams) {
     return materializeParamPairs(entries, paramNames);
@@ -402,7 +551,7 @@ function materializeHeaderObject(entries, plan) {
 
 function materializeQueryObject(url, flags, plan) {
   if (!(flags & REQUEST_FLAG_QUERY_PRESENT)) {
-    return {};
+    return Object.create(null);
   }
 
   if (plan.fullQuery) {
@@ -413,11 +562,16 @@ function materializeQueryObject(url, flags, plan) {
 }
 
 function materializePairs(entries, lowerCaseKeys = false) {
-  const result = {};
+  // Security: null-prototype object prevents prototype pollution
+  const result = Object.create(null);
 
   for (const [rawName, rawValue] of entries) {
     const name = textDecoder.decode(rawName);
     const key = lowerCaseKeys ? name.toLowerCase() : name;
+    // Security: skip dangerous prototype keys
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
     result[key] = textDecoder.decode(rawValue);
   }
 
@@ -425,10 +579,14 @@ function materializePairs(entries, lowerCaseKeys = false) {
 }
 
 function materializeParamPairs(entries, paramNames) {
-  const result = {};
+  const result = Object.create(null);
 
   for (let index = 0; index < entries.length; index += 1) {
-    result[paramNames[index]] = textDecoder.decode(entries[index]);
+    const key = paramNames[index];
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
+    result[key] = textDecoder.decode(entries[index]);
   }
 
   return result;
@@ -436,13 +594,13 @@ function materializeParamPairs(entries, paramNames) {
 
 function materializeSelectedParamPairs(entries, paramNames, selectedKeys) {
   if (selectedKeys.size === 0) {
-    return {};
+    return Object.create(null);
   }
 
-  const result = {};
+  const result = Object.create(null);
   for (let index = 0; index < entries.length; index += 1) {
     const key = paramNames[index];
-    if (selectedKeys.has(key)) {
+    if (selectedKeys.has(key) && !DANGEROUS_KEYS.has(key)) {
       result[key] = textDecoder.decode(entries[index]);
     }
   }
@@ -452,14 +610,14 @@ function materializeSelectedParamPairs(entries, paramNames, selectedKeys) {
 
 function materializeSelectedPairs(entries, selectedKeys, lowerCaseKeys = false) {
   if (selectedKeys.size === 0) {
-    return {};
+    return Object.create(null);
   }
 
-  const result = {};
+  const result = Object.create(null);
   for (const [rawName, rawValue] of entries) {
     const name = textDecoder.decode(rawName);
     const key = lowerCaseKeys ? name.toLowerCase() : name;
-    if (selectedKeys.has(key)) {
+    if (selectedKeys.has(key) && !DANGEROUS_KEYS.has(key)) {
       result[key] = textDecoder.decode(rawValue);
     }
   }
@@ -470,13 +628,16 @@ function materializeSelectedPairs(entries, selectedKeys, lowerCaseKeys = false) 
 function parseQuery(url) {
   const queryStart = url.indexOf("?");
   if (queryStart < 0 || queryStart === url.length - 1) {
-    return {};
+    return Object.create(null);
   }
 
   const params = new URLSearchParams(url.slice(queryStart + 1));
-  const result = {};
+  const result = Object.create(null);
 
   for (const [key, value] of params) {
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
     pushQueryEntry(result, key, value);
   }
 
@@ -485,19 +646,19 @@ function parseQuery(url) {
 
 function parseSelectedQuery(url, selectedKeys) {
   if (selectedKeys.size === 0) {
-    return {};
+    return Object.create(null);
   }
 
   const queryStart = url.indexOf("?");
   if (queryStart < 0 || queryStart === url.length - 1) {
-    return {};
+    return Object.create(null);
   }
 
   const params = new URLSearchParams(url.slice(queryStart + 1));
-  const result = {};
+  const result = Object.create(null);
 
   for (const [key, value] of params) {
-    if (selectedKeys.has(key)) {
+    if (selectedKeys.has(key) && !DANGEROUS_KEYS.has(key)) {
       pushQueryEntry(result, key, value);
     }
   }
@@ -529,6 +690,8 @@ function lookupHeaderValue(entries, targetName) {
 
   return undefined;
 }
+
+// ─── Access Plan ──────────────────────────────────────────────────────────────
 
 function createEmptyAccessPlan() {
   return {
@@ -590,87 +753,6 @@ function addSetEntries(target, source) {
   }
 }
 
-function trySerializeJsonFast(value) {
-  const stack = new WeakSet();
-  return serializeJsonValue(value, stack);
-}
-
-function serializeJsonValue(value, stack) {
-  if (value === null) {
-    return "null";
-  }
-
-  switch (typeof value) {
-    case "string":
-      return JSON.stringify(value);
-    case "number":
-      return Number.isFinite(value) ? (Object.is(value, -0) ? "0" : String(value)) : "null";
-    case "boolean":
-      return value ? "true" : "false";
-    case "undefined":
-    case "function":
-    case "symbol":
-      return null;
-    case "bigint":
-      return null;
-    case "object":
-      break;
-    default:
-      return null;
-  }
-
-  if (typeof value.toJSON === "function") {
-    return null;
-  }
-
-  if (Array.isArray(value)) {
-    if (stack.has(value)) {
-      return null;
-    }
-
-    stack.add(value);
-    const items = new Array(value.length);
-    for (let index = 0; index < value.length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-      if (descriptor && (descriptor.get || descriptor.set)) {
-        stack.delete(value);
-        return null;
-      }
-
-      const serialized = serializeJsonValue(value[index], stack);
-      items[index] = serialized === null ? "null" : serialized;
-    }
-    stack.delete(value);
-    return `[${items.join(",")}]`;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== PLAIN_OBJECT_PROTOTYPE && prototype !== null) {
-    return null;
-  }
-
-  if (stack.has(value)) {
-    return null;
-  }
-
-  stack.add(value);
-  const entries = [];
-  for (const key of Object.keys(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor && (descriptor.get || descriptor.set)) {
-      stack.delete(value);
-      return null;
-    }
-
-    const serializedValue = serializeJsonValue(value[key], stack);
-    if (serializedValue !== null) {
-      entries.push(`${JSON.stringify(key)}:${serializedValue}`);
-    }
-  }
-  stack.delete(value);
-  return `{${entries.join(",")}}`;
-}
-
 function identity(value) {
   return value;
 }
@@ -678,6 +760,8 @@ function identity(value) {
 function encodeUtf8(value) {
   return textEncoder.encode(String(value));
 }
+
+// ─── Binary Protocol Helpers ──────────────────────────────────────────────────
 
 function readBytes(bytes, offset, length) {
   if (offset + length > bytes.byteLength) {

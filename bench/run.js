@@ -9,7 +9,7 @@ const port = Number(portArg ?? 3001);
 
 function printUsage() {
   console.log("Usage: bun bench/run.js <engine> <scenario> <port>");
-  console.log("Engines: http-native | bun | old | xitca | monoio | zig");
+  console.log("Engines: http-native | bun | xitca | monoio | zig");
   console.log("Scenarios: static | dynamic | opt");
   console.log("");
   console.log("Example:");
@@ -30,7 +30,7 @@ function benchmarkPathForScenario(activeScenario) {
 }
 
 async function main() {
-  if (!["http-native", "bun", "old", "xitca", "monoio", "zig"].includes(engine)) {
+  if (!["http-native", "bun", "xitca", "monoio", "zig"].includes(engine)) {
     printUsage();
     process.exit(1);
   }
@@ -43,33 +43,33 @@ async function main() {
   const child =
     engine === "xitca" || engine === "monoio"
       ? spawn(
-          "cargo",
-          [
-            "run",
-            "--release",
-            "--manifest-path",
-            engine === "xitca"
-              ? "bench/xitca-server/Cargo.toml"
-              : "bench/monoio-server/Cargo.toml",
-            "--",
-            scenario,
-            String(port),
-          ],
+        "cargo",
+        [
+          "run",
+          "--release",
+          "--manifest-path",
+          engine === "xitca"
+            ? "bench/xitca-server/Cargo.toml"
+            : "bench/monoio-server/Cargo.toml",
+          "--",
+          scenario,
+          String(port),
+        ],
+        {
+          cwd: process.cwd(),
+          stdio: ["ignore", "pipe", "inherit"],
+        },
+      )
+      : engine === "zig"
+        ? spawn(
+          "zig",
+          ["build", "run", "-Doptimize=ReleaseFast", "--", scenario, String(port)],
           {
-            cwd: process.cwd(),
+            cwd: `${process.cwd()}/bench/zig-httpz`,
             stdio: ["ignore", "pipe", "inherit"],
           },
         )
-      : engine === "zig"
-        ? spawn(
-            "zig",
-            ["build", "run", "-Doptimize=ReleaseFast", "--", scenario, String(port)],
-            {
-              cwd: `${process.cwd()}/bench/zig-httpz`,
-              stdio: ["ignore", "pipe", "inherit"],
-            },
-          )
-      : spawn("bun", ["bench/target.js", engine, scenario, String(port)], {
+        : spawn("bun", ["bench/target.js", engine, scenario, String(port)], {
           cwd: process.cwd(),
           stdio: ["ignore", "pipe", "inherit"],
         });

@@ -10,32 +10,17 @@ use crate::manifest::{ManifestInput, RouteInput};
 const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
 
+// ─── Public Types ─────────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct Router {
     exact_get_root: Option<ExactStaticRoute>,
+    /// O(1) exact-match routes (HashMap<method, HashMap<path_bytes, spec>>)
     dynamic_exact_routes: HashMap<MethodKey, HashMap<Box<[u8]>, DynamicRouteSpec>>,
-    dynamic_param_routes: HashMap<MethodKey, HashMap<u16, Vec<ParamRoute>>>,
+    /// O(1) static-response routes
     exact_static_routes: HashMap<MethodKey, HashMap<Box<[u8]>, ExactStaticRoute>>,
-}
-
-#[derive(Clone)]
-struct ParamRoute {
-    spec: DynamicRouteSpec,
-    segments: Vec<CompiledSegment>,
-}
-
-#[derive(Clone)]
-struct DynamicRouteSpec {
-    handler_id: u32,
-    param_names: Box<[Box<str>]>,
-    header_keys: Box<[Box<str>]>,
-    full_headers: bool,
-}
-
-#[derive(Clone)]
-enum CompiledSegment {
-    Static(Box<str>),
-    Param,
+    /// O(M) radix-tree routes per method (M = path length)  
+    radix_trees: HashMap<MethodKey, RadixNode>,
 }
 
 #[derive(Clone)]
@@ -51,6 +36,17 @@ pub struct MatchedRoute<'a, 'b> {
     pub full_headers: bool,
 }
 
+// ─── Internal Types ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct DynamicRouteSpec {
+    handler_id: u32,
+    #[allow(dead_code)]
+    param_names: Box<[Box<str>]>,
+    header_keys: Box<[Box<str>]>,
+    full_headers: bool,
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum MethodKey {
     Delete,
@@ -62,12 +58,126 @@ enum MethodKey {
     Put,
 }
 
+// ─── Radix Tree ───────────────────────────────────────────────────────────────
+//
+// Each node represents either a static prefix or a parameter capture.
+// Matching is O(M) where M is the number of path segments, not O(N) routes.
+
+#[derive(Clone)]
+struct RadixNode {
+    children: Vec<RadixChild>,
+    /// If this node is a terminal route, the handler spec
+    handler: Option<DynamicRouteSpec>,
+    /// Parameter capture node for this level
+    param_child: Option<Box<RadixParamChild>>,
+}
+
+#[derive(Clone)]
+struct RadixChild {
+    /// The static segment this child matches
+    segment: Box<str>,
+    node: RadixNode,
+}
+
+#[derive(Clone)]
+struct RadixParamChild {
+    node: RadixNode,
+}
+
+impl RadixNode {
+    fn new() -> Self {
+        Self {
+            children: Vec::new(),
+            handler: None,
+            param_child: None,
+        }
+    }
+
+    /// Insert a route into the radix tree
+    fn insert(&mut self, segments: &[RouteSegment], spec: DynamicRouteSpec) {
+        if segments.is_empty() {
+            self.handler = Some(spec);
+            return;
+        }
+
+        match &segments[0] {
+            RouteSegment::Static(value) => {
+                // Find existing child with this segment
+                for child in &mut self.children {
+                    if child.segment.as_ref() == value.as_str() {
+                        child.node.insert(&segments[1..], spec);
+                        return;
+                    }
+                }
+
+                // Create new child
+                let mut child_node = RadixNode::new();
+                child_node.insert(&segments[1..], spec);
+                self.children.push(RadixChild {
+                    segment: value.clone().into_boxed_str(),
+                    node: child_node,
+                });
+            }
+            RouteSegment::Param(_) => {
+                if self.param_child.is_none() {
+                    self.param_child = Some(Box::new(RadixParamChild {
+                        node: RadixNode::new(),
+                    }));
+                }
+                self.param_child
+                    .as_mut()
+                    .unwrap()
+                    .node
+                    .insert(&segments[1..], spec);
+            }
+        }
+    }
+
+    /// Match a request path against this radix tree — O(M) where M = segment count
+    fn match_path<'a, 'b>(
+        &'a self,
+        segments: &[&'b str],
+        param_values: &mut Vec<&'b str>,
+    ) -> Option<&'a DynamicRouteSpec> {
+        if segments.is_empty() {
+            return self.handler.as_ref();
+        }
+
+        let segment = segments[0];
+        let rest = &segments[1..];
+
+        // Try static children first (higher priority)
+        for child in &self.children {
+            if child.segment.as_ref() == segment {
+                if let Some(spec) = child.node.match_path(rest, param_values) {
+                    return Some(spec);
+                }
+            }
+        }
+
+        // Try parameter capture
+        if let Some(param_child) = &self.param_child {
+            let prev_len = param_values.len();
+            param_values.push(segment);
+            if let Some(spec) = param_child.node.match_path(rest, param_values) {
+                return Some(spec);
+            }
+            // Backtrack
+            param_values.truncate(prev_len);
+        }
+
+        None
+    }
+}
+
+// ─── Router Implementation ────────────────────────────────────────────────────
+
 impl Router {
     pub fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
         let mut exact_get_root = None;
         let mut dynamic_exact_routes = HashMap::new();
-        let mut dynamic_param_routes = HashMap::new();
         let mut exact_static_routes = HashMap::new();
+        let mut radix_trees: HashMap<MethodKey, RadixNode> = HashMap::new();
 
         for route in &manifest.routes {
             let method = route.method.to_uppercase();
@@ -119,13 +229,13 @@ impl Router {
                         );
                 }
                 ROUTE_KIND_PARAM => {
-                    let compiled = compile_param_route(route, path.as_str());
-                    dynamic_param_routes
+                    // Insert into radix tree instead of linear Vec
+                    let segments = parse_segments(path.as_str());
+                    let spec = compile_dynamic_route_spec(route);
+                    radix_trees
                         .entry(method_key)
-                        .or_insert_with(HashMap::new)
-                        .entry(route.segment_count)
-                        .or_insert_with(Vec::new)
-                        .push(compiled);
+                        .or_insert_with(RadixNode::new)
+                        .insert(&segments, spec);
                 }
                 _ => {}
             }
@@ -134,8 +244,8 @@ impl Router {
         Ok(Self {
             exact_get_root,
             dynamic_exact_routes,
-            dynamic_param_routes,
             exact_static_routes,
+            radix_trees,
         })
     }
 
@@ -146,6 +256,7 @@ impl Router {
     ) -> Option<MatchedRoute<'a, 'b>> {
         let method_key = MethodKey::from_code(method_code)?;
 
+        // Fast path: exact match (O(1))
         if let Some(route_spec) = self
             .dynamic_exact_routes
             .get(&method_key)
@@ -159,40 +270,18 @@ impl Router {
             });
         }
 
-        let path_segments = split_request_segments(path);
-        let param_routes = self
-            .dynamic_param_routes
-            .get(&method_key)
-            .and_then(|routes| routes.get(&(path_segments.len() as u16)))?;
+        // Radix tree match (O(M) where M = segment count)
+        let segments = split_request_segments(path);
+        let tree = self.radix_trees.get(&method_key)?;
+        let mut param_values = Vec::new();
+        let spec = tree.match_path(&segments, &mut param_values)?;
 
-        for route in param_routes {
-            let mut param_values = Vec::with_capacity(route.spec.param_names.len());
-            let mut matched = true;
-
-            for (segment, path_segment) in route.segments.iter().zip(path_segments.iter()) {
-                match segment {
-                    CompiledSegment::Static(value) if value.as_ref() == *path_segment => {}
-                    CompiledSegment::Static(_) => {
-                        matched = false;
-                        break;
-                    }
-                    CompiledSegment::Param => {
-                        param_values.push(*path_segment);
-                    }
-                }
-            }
-
-            if matched {
-                return Some(MatchedRoute {
-                    handler_id: route.spec.handler_id,
-                    param_values,
-                    header_keys: route.spec.header_keys.as_ref(),
-                    full_headers: route.spec.full_headers,
-                });
-            }
-        }
-
-        None
+        Some(MatchedRoute {
+            handler_id: spec.handler_id,
+            param_values,
+            header_keys: spec.header_keys.as_ref(),
+            full_headers: spec.full_headers,
+        })
     }
 
     pub fn exact_static_route(&self, method: &[u8], path: &[u8]) -> Option<&ExactStaticRoute> {
@@ -210,6 +299,8 @@ impl Router {
         self.exact_get_root.as_ref()
     }
 }
+
+// ─── MethodKey ────────────────────────────────────────────────────────────────
 
 impl MethodKey {
     fn from_method_str(method: &str) -> Option<Self> {
@@ -252,20 +343,7 @@ impl MethodKey {
     }
 }
 
-fn compile_param_route(route: &RouteInput, path: &str) -> ParamRoute {
-    let segments = parse_segments(path)
-        .into_iter()
-        .map(|segment| match segment {
-            RouteSegment::Static(value) => CompiledSegment::Static(value.into_boxed_str()),
-            RouteSegment::Param(_) => CompiledSegment::Param,
-        })
-        .collect();
-
-    ParamRoute {
-        spec: compile_dynamic_route_spec(route),
-        segments,
-    }
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn compile_dynamic_route_spec(route: &RouteInput) -> DynamicRouteSpec {
     let param_names = route
@@ -328,6 +406,10 @@ fn build_response_bytes(
     .into_bytes();
 
     for (name, value) in headers {
+        // Security: skip headers with CRLF injection
+        if name.contains('\r') || name.contains('\n') || value.contains('\r') || value.contains('\n') {
+            continue;
+        }
         response.extend_from_slice(name.as_bytes());
         response.extend_from_slice(b": ");
         response.extend_from_slice(value.as_bytes());

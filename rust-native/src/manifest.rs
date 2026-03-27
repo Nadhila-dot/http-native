@@ -38,6 +38,7 @@ pub struct RouteInput {
     pub handler_id: u32,
     pub handler_source: String,
     pub param_names: Vec<String>,
+    #[allow(dead_code)]
     pub segment_count: u16,
     pub header_keys: Vec<String>,
     pub full_headers: bool,

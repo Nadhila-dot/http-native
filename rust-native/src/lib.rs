@@ -1,40 +1,435 @@
-use anyhow::{Context, Result};
+mod analyzer;
+mod manifest;
+mod router;
+
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use monoio::io::{AsyncReadExt, AsyncWriteExt};
-use monoio::net::{TcpListener, TcpStream};
-use monoio::utils::memmem;
-use napi::bindgen_prelude::Buffer;
+use memchr::memmem;
+use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
+use monoio::net::{ListenerOpts, TcpListener, TcpStream};
+use napi::bindgen_prelude::{Buffer, Function, Promise};
+use napi::threadsafe_function::ThreadsafeFunction;
+use napi::{Error, Status};
+use napi_derive::napi;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+
+use crate::manifest::{HttpServerConfigInput, ManifestInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
-use crate::manifest::HttpServerConfigInput;
 
-// ─── Constants & Limits ───────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-const MAX_HEADERS: usize = 64;
-const MAX_BODY_BYTES: usize = 1024 * 1024; // 1MB limit for safety
-const REQUEST_FLAG_QUERY_PRESENT: u16 = 1;
+const FALLBACK_DEFAULT_HOST: &str = "127.0.0.1";
+const FALLBACK_DEFAULT_BACKLOG: i32 = 2048;
+const FALLBACK_MAX_HEADER_BYTES: usize = 16 * 1024;
+const FALLBACK_HOT_GET_ROOT_HTTP11: &str = "GET / HTTP/1.1\r\n";
+const FALLBACK_HOT_GET_ROOT_HTTP10: &str = "GET / HTTP/1.0\r\n";
+const FALLBACK_HEADER_CONNECTION_PREFIX: &str = "connection:";
+const FALLBACK_HEADER_CONTENT_LENGTH_PREFIX: &str = "content-length:";
+const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
+const BRIDGE_VERSION: u8 = 1;
+const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
+const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
+const NOT_FOUND_BODY: &[u8] = br#"{"error":"Route not found"}"#;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+/// Security: Maximum number of headers we allow per request
+const MAX_HEADER_COUNT: usize = 64;
+/// Security: Maximum URL length to prevent abuse
+const MAX_URL_LENGTH: usize = 8192;
+/// Security: Maximum single header value length
+const MAX_HEADER_VALUE_LENGTH: usize = 8192;
+/// Security: Maximum request body size (1 MB)
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-pub type JsDispatcher = napi::threadsafe_function::ThreadsafeFunction<Buffer>;
+/// Buffer pool: initial capacity for connection read buffers
+const BUFFER_INITIAL_CAPACITY: usize = 8192;
+/// Buffer pool: max buffers held per thread
+const BUFFER_POOL_MAX_SIZE: usize = 256;
+/// Buffer pool: max buffer size to recycle (don't recycle oversized buffers)
+const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
 
-#[derive(Clone, Debug)]
-pub struct HttpServerConfig {
-    pub default_host: String,
-    pub default_backlog: i32,
-    pub max_header_bytes: usize,
-    pub hot_get_root_http11: Vec<u8>,
-    pub hot_get_root_http10: Vec<u8>,
-    pub header_connection_prefix: Vec<u8>,
-    pub header_content_length_prefix: Vec<u8>,
-    pub header_transfer_encoding_prefix: Vec<u8>,
+type DispatchTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, Status, false, false, 0>;
+
+// ─── Thread-Local Buffer Pool ─────────────────────────────────────────────────
+//
+// Eliminates per-connection Vec<u8> allocations by recycling buffers.
+
+thread_local! {
+    static BUFFER_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(BUFFER_POOL_MAX_SIZE));
 }
 
-pub struct ParsedRequest<'a> {
+fn acquire_buffer() -> Vec<u8> {
+    BUFFER_POOL.with(|pool| {
+        pool.borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(BUFFER_INITIAL_CAPACITY))
+    })
+}
+
+fn release_buffer(mut buf: Vec<u8>) {
+    if buf.capacity() > BUFFER_POOL_MAX_RECYCLE_SIZE {
+        return; // Don't recycle oversized buffers
+    }
+    buf.clear();
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < BUFFER_POOL_MAX_SIZE {
+            pool.push(buf);
+        }
+    });
+}
+
+// ─── Server Configuration ─────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct HttpServerConfig {
+    default_host: String,
+    default_backlog: i32,
+    max_header_bytes: usize,
+    hot_get_root_http11: Vec<u8>,
+    hot_get_root_http10: Vec<u8>,
+    header_connection_prefix: Vec<u8>,
+    header_content_length_prefix: Vec<u8>,
+    header_transfer_encoding_prefix: Vec<u8>,
+}
+
+impl HttpServerConfig {
+    fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
+        let input = manifest.server_config.as_ref();
+        let default_backlog = input
+            .and_then(|config| config.default_backlog)
+            .unwrap_or(FALLBACK_DEFAULT_BACKLOG);
+        let max_header_bytes = input
+            .and_then(|config| config.max_header_bytes)
+            .unwrap_or(FALLBACK_MAX_HEADER_BYTES);
+
+        if default_backlog <= 0 {
+            return Err(anyhow!(
+                "serverConfig.defaultBacklog must be greater than 0"
+            ));
+        }
+
+        if max_header_bytes == 0 {
+            return Err(anyhow!(
+                "serverConfig.maxHeaderBytes must be greater than 0"
+            ));
+        }
+
+        Ok(Self {
+            default_host: config_string(
+                input,
+                |config| config.default_host.as_deref(),
+                FALLBACK_DEFAULT_HOST,
+            ),
+            default_backlog,
+            max_header_bytes,
+            hot_get_root_http11: config_string(
+                input,
+                |config| config.hot_get_root_http11.as_deref(),
+                FALLBACK_HOT_GET_ROOT_HTTP11,
+            )
+            .into_bytes(),
+            hot_get_root_http10: config_string(
+                input,
+                |config| config.hot_get_root_http10.as_deref(),
+                FALLBACK_HOT_GET_ROOT_HTTP10,
+            )
+            .into_bytes(),
+            header_connection_prefix: config_string(
+                input,
+                |config| config.header_connection_prefix.as_deref(),
+                FALLBACK_HEADER_CONNECTION_PREFIX,
+            )
+            .into_bytes(),
+            header_content_length_prefix: config_string(
+                input,
+                |config| config.header_content_length_prefix.as_deref(),
+                FALLBACK_HEADER_CONTENT_LENGTH_PREFIX,
+            )
+            .into_bytes(),
+            header_transfer_encoding_prefix: config_string(
+                input,
+                |config| config.header_transfer_encoding_prefix.as_deref(),
+                FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX,
+            )
+            .into_bytes(),
+        })
+    }
+}
+
+// ─── NAPI Interface ───────────────────────────────────────────────────────────
+
+#[napi(object)]
+pub struct NativeListenOptions {
+    pub host: Option<String>,
+    pub port: u16,
+    pub backlog: Option<i32>,
+}
+
+struct ShutdownHandle {
+    flag: Arc<AtomicBool>,
+    wake_addrs: Vec<SocketAddr>,
+}
+
+#[napi]
+pub struct NativeServerHandle {
+    host: String,
+    port: u32,
+    url: String,
+    shutdown: Mutex<Option<ShutdownHandle>>,
+    closed: Mutex<Option<Vec<mpsc::Receiver<()>>>>,
+}
+
+#[napi]
+impl NativeServerHandle {
+    #[napi(getter)]
+    pub fn host(&self) -> String {
+        self.host.clone()
+    }
+
+    #[napi(getter)]
+    pub fn port(&self) -> u32 {
+        self.port
+    }
+
+    #[napi(getter)]
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    #[napi]
+    pub fn close(&self) -> napi::Result<()> {
+        if let Some(shutdown) = self
+            .shutdown
+            .lock()
+            .expect("shutdown mutex poisoned")
+            .take()
+        {
+            shutdown.flag.store(true, Ordering::SeqCst);
+            for wake_addr in shutdown.wake_addrs {
+                let _ = std::net::TcpStream::connect(wake_addr);
+            }
+        }
+
+        if let Some(receivers) = self.closed.lock().expect("closed mutex poisoned").take() {
+            for receiver in receivers {
+                let _ = receiver.recv();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[napi]
+pub fn start_server(
+    manifest_json: String,
+    dispatcher: Function<'_, Buffer, Promise<Buffer>>,
+    options: NativeListenOptions,
+) -> napi::Result<NativeServerHandle> {
+    let manifest: ManifestInput = serde_json::from_str(&manifest_json).map_err(to_napi_error)?;
+    validate_manifest(&manifest).map_err(to_napi_error)?;
+    let server_config =
+        Arc::new(HttpServerConfig::from_manifest(&manifest).map_err(to_napi_error)?);
+    let router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+
+    let callback: DispatchTsfn = dispatcher
+        .build_threadsafe_function::<Buffer>()
+        .build()
+        .map_err(to_napi_error)?;
+    let dispatcher = Arc::new(JsDispatcher { callback });
+
+    let worker_count = worker_count_for(&options);
+    let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(worker_count);
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let mut closed_receivers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let (closed_tx, closed_rx) = mpsc::channel::<()>();
+        closed_receivers.push(closed_rx);
+
+        let thread_router = Arc::clone(&router);
+        let thread_dispatcher = Arc::clone(&dispatcher);
+        let thread_config = Arc::clone(&server_config);
+        let thread_shutdown = Arc::clone(&shutdown_flag);
+        let thread_options = NativeListenOptions {
+            host: options.host.clone(),
+            port: options.port,
+            backlog: options.backlog,
+        };
+        let thread_startup_tx = startup_tx.clone();
+
+        std::thread::spawn(move || {
+            let startup_tx_error = thread_startup_tx.clone();
+            let result = (|| -> Result<()> {
+                let mut runtime = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .build()
+                    .context("failed to build monoio runtime")?;
+
+                runtime.block_on(async move {
+                    let listener = bind_listener(&thread_options, thread_config.as_ref())
+                        .context("failed to create monoio listener")?;
+                    let local_addr = listener.local_addr()?;
+                    let _ = thread_startup_tx.send(Ok(local_addr));
+                    run_server(
+                        listener,
+                        thread_router,
+                        thread_dispatcher,
+                        thread_config,
+                        thread_shutdown,
+                    )
+                    .await
+                })
+            })();
+
+            if let Err(error) = &result {
+                let _ = startup_tx_error.send(Err(error.to_string()));
+                eprintln!("[http-native] native server error: {error:#}");
+            }
+
+            let _ = closed_tx.send(());
+        });
+    }
+
+    let mut wake_addrs = Vec::with_capacity(worker_count);
+    let mut local_addr = None;
+    for _ in 0..worker_count {
+        match startup_rx.recv() {
+            Ok(Ok(addr)) => {
+                if local_addr.is_none() {
+                    local_addr = Some(addr);
+                }
+                wake_addrs.push(addr);
+            }
+            Ok(Err(message)) => {
+                shutdown_flag.store(true, Ordering::SeqCst);
+                for wake_addr in &wake_addrs {
+                    let _ = std::net::TcpStream::connect(*wake_addr);
+                }
+                for receiver in closed_receivers {
+                    let _ = receiver.recv();
+                }
+                return Err(Error::from_reason(message));
+            }
+            Err(_) => {
+                shutdown_flag.store(true, Ordering::SeqCst);
+                for wake_addr in &wake_addrs {
+                    let _ = std::net::TcpStream::connect(*wake_addr);
+                }
+                for receiver in closed_receivers {
+                    let _ = receiver.recv();
+                }
+                return Err(Error::from_reason(
+                    "Native server exited before reporting readiness".to_string(),
+                ));
+            }
+        }
+    }
+
+    let local_addr = local_addr.expect("worker count must be at least 1");
+
+    let host = local_addr.ip().to_string();
+    let port = local_addr.port() as u32;
+
+    Ok(NativeServerHandle {
+        host: host.clone(),
+        port,
+        url: format!("http://{host}:{port}"),
+        shutdown: Mutex::new(Some(ShutdownHandle {
+            flag: shutdown_flag,
+            wake_addrs,
+        })),
+        closed: Mutex::new(Some(closed_receivers)),
+    })
+}
+
+fn worker_count_for(options: &NativeListenOptions) -> usize {
+    if options.port == 0 {
+        return 1;
+    }
+
+    std::env::var("HTTP_NATIVE_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(1)
+}
+
+// ─── JS Dispatcher ────────────────────────────────────────────────────────────
+
+struct JsDispatcher {
+    callback: DispatchTsfn,
+}
+
+impl JsDispatcher {
+    async fn dispatch(&self, request: Buffer) -> Result<Buffer> {
+        let response_json = self
+            .callback
+            .call_async(request)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+
+        Ok(response_json)
+    }
+}
+
+// ─── Server Loop ──────────────────────────────────────────────────────────────
+
+async fn run_server(
+    listener: TcpListener,
+    router: Arc<Router>,
+    dispatcher: Arc<JsDispatcher>,
+    server_config: Arc<HttpServerConfig>,
+    shutdown_flag: Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            break;
+        }
+
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
+
+                if let Err(error) = stream.set_nodelay(true) {
+                    eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
+                }
+
+                let router = Arc::clone(&router);
+                let dispatcher = Arc::clone(&dispatcher);
+                let server_config = Arc::clone(&server_config);
+
+                monoio::spawn(async move {
+                    if let Err(error) =
+                        handle_connection(stream, router, dispatcher, server_config).await
+                    {
+                        eprintln!("[http-native] connection error: {error}");
+                    }
+                });
+            }
+            Err(error) => {
+                if shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
+
+                eprintln!("[http-native] accept error: {error}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Parsed Request (from httparse) ───────────────────────────────────────────
+
+struct ParsedRequest<'a> {
     method: &'a [u8],
     target: &'a [u8],
     path: &'a [u8],
@@ -42,92 +437,11 @@ pub struct ParsedRequest<'a> {
     header_bytes: usize,
     has_body: bool,
     content_length: Option<usize>,
+    /// Pre-parsed header pairs — stored once, used by both routing and bridge
     headers: Vec<(&'a str, &'a str)>,
 }
 
-// ─── Buffer Pooling ───────────────────────────────────────────────────────────
-//
-// Zero-allocation buffer management. Buffers are re-used across connections
-// within the same thread to avoid expensive syscalls and allocator pressure.
-
-thread_local! {
-    static BUFFER_POOL: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(65536));
-}
-
-fn acquire_buffer() -> Vec<u8> {
-    BUFFER_POOL.with(|pool| {
-        let mut b = pool.borrow_mut();
-        if b.capacity() < 65536 {
-            Vec::with_capacity(65536)
-        } else {
-            std::mem::take(&mut *b)
-        }
-    })
-}
-
-fn release_buffer(mut buf: Vec<u8>) {
-    buf.clear();
-    BUFFER_POOL.with(|pool| {
-        *pool.borrow_mut() = buf;
-    });
-}
-
-// ─── Server Entry Point ───────────────────────────────────────────────────────
-
-pub fn start_server(
-    manifest_json: String,
-    handler: JsDispatcher,
-    options: NativeListenOptions,
-) -> Result<ServerHandle> {
-    let manifest: crate::manifest::ManifestInput = serde_json::from_str(&manifest_json)?;
-    let router = Arc::new(Router::from_manifest(&manifest)?);
-    let dispatcher = Arc::new(handler);
-    let server_config = Arc::new(HttpServerConfig::from_input(manifest.server_config.as_ref()));
-
-    let worker_count = worker_count_for(&options);
-    let mut workers = Vec::with_capacity(worker_count);
-
-    for i in 0..worker_count {
-        let router = Arc::clone(&router);
-        let dispatcher = Arc::clone(&dispatcher);
-        let server_config = Arc::clone(&server_config);
-        let options = options.clone();
-
-        let handle = thread::spawn(move || {
-            let mut driver = monoio::RuntimeBuilder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            driver.block_on(async move {
-                let listener = bind_listener(&options, &server_config)?;
-                
-                loop {
-                    let (stream, _) = listener.accept().await?;
-                    
-                    if should_enable_nodelay() {
-                        if let Err(error) = stream.set_nodelay(true) {
-                            eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
-                        }
-                    }
-
-                    let router = Arc::clone(&router);
-                    let dispatcher = Arc::clone(&dispatcher);
-                    let server_config = Arc::clone(&server_config);
-
-                    monoio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, router, dispatcher, server_config).await {
-                            eprintln!("[http-native] worker {i} connection error: {e}");
-                        }
-                    });
-                }
-            })
-        });
-        workers.push(handle);
-    }
-
-    Ok(ServerHandle { workers })
-}
+// ─── Connection Handler with Buffer Pool ──────────────────────────────────────
 
 async fn handle_connection(
     mut stream: TcpStream,
@@ -158,7 +472,7 @@ async fn handle_connection_inner(
     server_config: &HttpServerConfig,
 ) -> Result<()> {
     loop {
-        // Try hot-path parsing first
+        // Try hot-path parsing first (GET / with known prefix)
         let parsed = loop {
             let result = if router.exact_get_root().is_some() {
                 parse_hot_root_request(buffer, server_config)
@@ -172,10 +486,12 @@ async fn handle_connection_inner(
             }
 
             if find_header_end(buffer).is_some() {
+                // Headers complete but couldn't parse — malformed request
                 stream.shutdown().await?;
                 return Ok(());
             }
 
+            // SAFETY: We take ownership of the buffer, read into it, then put it back
             let owned_buf = std::mem::take(buffer);
             let (read_result, next_buffer) = stream.read(owned_buf).await;
             *buffer = next_buffer;
@@ -186,6 +502,7 @@ async fn handle_connection_inner(
             }
 
             if buffer.len() > server_config.max_header_bytes {
+                // Security: Request header too large
                 let response = build_error_response_bytes(
                     431,
                     b"{\"error\":\"Request Header Fields Too Large\"}",
@@ -241,10 +558,12 @@ async fn handle_connection_inner(
 
         // ── Read request body if present ──────────────────────────────
         let body_bytes: Vec<u8> = if has_body {
-            let cl = match content_length {
+            let content_length = match content_length {
                 Some(len) => len,
                 None => {
-                    let response = build_error_response_bytes(411, b"{\"error\":\"Length Required\"}", false);
+                    // Chunked or unknown body length — reject for now
+                    let response =
+                        build_error_response_bytes(411, b"{\"error\":\"Length Required\"}", false);
                     let (write_result, _) = stream.write_all(response).await;
                     write_result?;
                     stream.shutdown().await?;
@@ -252,42 +571,47 @@ async fn handle_connection_inner(
                 }
             };
 
-            if cl > MAX_BODY_BYTES {
-                let response = build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
+            // Security: enforce max body size
+            if content_length > MAX_BODY_BYTES {
+                let response =
+                    build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
                 let (write_result, _) = stream.write_all(response).await;
                 write_result?;
                 stream.shutdown().await?;
                 return Ok(());
             }
 
+            // Some body bytes may already be in the buffer after the headers
             let already_in_buffer = if buffer.len() > header_bytes {
                 buffer.len() - header_bytes
             } else {
                 0
             };
 
-            if already_in_buffer >= cl {
-                let body = buffer[header_bytes..header_bytes + cl].to_vec();
-                drain_consumed_bytes(buffer, header_bytes + cl);
+            if already_in_buffer >= content_length {
+                // Entire body is already in the buffer
+                let body = buffer[header_bytes..header_bytes + content_length].to_vec();
+                drain_consumed_bytes(buffer, header_bytes + content_length);
                 body
             } else {
-                let mut body = Vec::with_capacity(cl);
+                // Need to read more bytes from the stream
+                let mut body = Vec::with_capacity(content_length);
                 if already_in_buffer > 0 {
                     body.extend_from_slice(&buffer[header_bytes..]);
                 }
                 drain_consumed_bytes(buffer, buffer.len());
 
-                while body.len() < cl {
-                    let remaining = cl - body.len();
+                while body.len() < content_length {
+                    let remaining = content_length - body.len();
                     let chunk_buf = vec![0u8; remaining.min(65536)];
                     let (read_result, returned_buf) = stream.read(chunk_buf).await;
                     let bytes_read = read_result?;
                     if bytes_read == 0 {
-                        return Ok(());
+                        return Ok(()); // Connection closed mid-body
                     }
                     body.extend_from_slice(&returned_buf[..bytes_read]);
                 }
-                body.truncate(cl);
+                body.truncate(content_length);
                 body
             }
         } else {
@@ -295,7 +619,7 @@ async fn handle_connection_inner(
             Vec::new()
         };
 
-        // ── Dynamic path: Bridge to JS ────
+        // Dynamic path: build bridge envelope and dispatch to JS
         let dispatch_request = build_dispatch_request_owned(
             router,
             &method_owned,
@@ -308,87 +632,121 @@ async fn handle_connection_inner(
         match dispatch_request {
             Some(request) => {
                 write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive).await?;
-                if !keep_alive {
-                    stream.shutdown().await?;
-                    return Ok(());
-                }
             }
             None => {
                 write_not_found_response(stream, keep_alive).await?;
-                if !keep_alive {
-                    stream.shutdown().await?;
-                    return Ok(());
-                }
             }
+        }
+
+        if !keep_alive {
+            stream.shutdown().await?;
+            return Ok(());
         }
     }
 }
 
-// ─── Header Parsers ───────────────────────────────────────────────────────────
+// ─── httparse-based Request Parsing ───────────────────────────────────────────
+//
+// Uses the battle-tested `httparse` crate for RFC-compliant zero-copy parsing.
+// Single-pass: parses headers once and stores them for reuse by both the
+// router and the bridge envelope builder.
 
 fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
-    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let mut req = httparse::Request::new(&mut headers);
+    let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
+    let mut req = httparse::Request::new(&mut raw_headers);
 
-    match req.parse(bytes) {
-        Ok(httparse::Status::Complete(header_len)) => {
-            let method = req.method?;
-            let target = req.path?;
-            let path = target.split(|&b| b == b'?').next()?;
-            
-            let mut keep_alive = req.version == Some(1); // Default true for HTTP/1.1
-            let mut content_length = None;
-            let mut has_body = false;
-            let mut parsed_headers = Vec::with_capacity(req.headers.len());
+    let header_len = match req.parse(bytes) {
+        Ok(httparse::Status::Complete(len)) => len,
+        Ok(httparse::Status::Partial) => return None,
+        Err(_) => return None, // Malformed — caller will handle
+    };
 
-            for h in req.headers {
-                let name = h.name.to_lowercase();
-                let value_bytes = h.value;
-                let value = std::str::from_utf8(value_bytes).ok()?;
+    let method = req.method?.as_bytes();
+    let target = req.path?.as_bytes();
+    let version = req.version?;
 
-                match name.as_str() {
-                    "connection" => {
-                        if contains_ascii_case_insensitive(value_bytes, b"close") {
-                            keep_alive = false;
-                        } else if contains_ascii_case_insensitive(value_bytes, b"keep-alive") {
-                            keep_alive = true;
-                        }
-                    }
-                    "content-length" => {
-                        if let Ok(len) = value.trim().parse::<usize>() {
-                            content_length = Some(len);
-                            if len > 0 { has_body = true; }
-                        }
-                    }
-                    "transfer-encoding" => {
-                        if !value.eq_ignore_ascii_case("identity") {
-                            has_body = true;
-                        }
-                    }
-                    _ => {}
-                }
-                parsed_headers.push((h.name, value));
-            }
-
-            Some(ParsedRequest {
-                method: method.as_bytes(),
-                target: target.as_bytes(),
-                path: path.as_bytes(),
-                keep_alive,
-                header_bytes: header_len,
-                has_body,
-                content_length,
-                headers: parsed_headers,
-            })
-        }
-        _ => None,
+    // Security: enforce URL length limit
+    if target.len() > MAX_URL_LENGTH {
+        return None;
     }
+
+    // Extract path (before '?')
+    let path = target.split(|b| *b == b'?').next()?;
+
+    let mut keep_alive = version >= 1; // HTTP/1.1+ defaults to keep-alive
+    let mut has_body = false;
+    let mut content_length: Option<usize> = None;
+    let mut headers = Vec::with_capacity(req.headers.len());
+
+    for header in req.headers.iter() {
+        if header.name.is_empty() {
+            break;
+        }
+
+        // Security: enforce header value length
+        if header.value.len() > MAX_HEADER_VALUE_LENGTH {
+            return None;
+        }
+
+        let name = header.name; // httparse gives us &str
+        let value = match std::str::from_utf8(header.value) {
+            Ok(v) => v,
+            Err(_) => continue, // Skip non-UTF-8 headers
+        };
+
+        // Connection handling
+        if name.eq_ignore_ascii_case("connection") {
+            let lower = value.to_ascii_lowercase();
+            if lower.contains("close") {
+                keep_alive = false;
+            }
+            if lower.contains("keep-alive") {
+                keep_alive = true;
+            }
+        }
+
+        // Body detection
+        if name.eq_ignore_ascii_case("content-length") {
+            let trimmed = value.trim();
+            if let Ok(len) = trimmed.parse::<usize>() {
+                content_length = Some(len);
+                if len > 0 {
+                    has_body = true;
+                }
+            }
+        }
+
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity") {
+                has_body = true;
+            }
+        }
+
+        headers.push((name, value));
+    }
+
+    Some(ParsedRequest {
+        method,
+        target,
+        path,
+        keep_alive,
+        header_bytes: header_len,
+        has_body,
+        content_length,
+        headers,
+    })
 }
 
-fn parse_hot_root_request<'a>(
-    bytes: &'a [u8],
+// ─── Hot Root Path (GET /) ────────────────────────────────────────────────────
+//
+// Ultra-fast path for the most common benchmark case. Falls back to httparse
+// if the request doesn't exactly match the expected prefix.
+
+fn parse_hot_root_request(
+    bytes: &[u8],
     server_config: &HttpServerConfig,
-) -> Option<ParsedRequest<'a>> {
+) -> Option<ParsedRequest<'static>> {
     let (_, keep_alive) = if bytes.starts_with(server_config.hot_get_root_http11.as_slice()) {
         (server_config.hot_get_root_http11.len(), true)
     } else if bytes.starts_with(server_config.hot_get_root_http10.as_slice()) {
@@ -398,24 +756,69 @@ fn parse_hot_root_request<'a>(
     };
 
     let header_end = find_header_end(bytes)?;
-    // For hot path, we just verify it looks like a header block ending
-    // but we use httparse for the actual details to be safe.
-    parse_request_httparse(bytes)
+    let mut keep_alive = keep_alive;
+    let mut has_body = false;
+    let mut line_start = bytes.iter().position(|b| *b == b'\n')? + 1;
+
+    while line_start + 2 <= header_end {
+        let next_end = memmem::find(&bytes[line_start..header_end + 2], b"\r\n")? + line_start;
+
+        if next_end == line_start {
+            break;
+        }
+
+        let line = &bytes[line_start..next_end];
+        if line.len() >= server_config.header_connection_prefix.len()
+            && line[..server_config.header_connection_prefix.len()]
+                .eq_ignore_ascii_case(server_config.header_connection_prefix.as_slice())
+        {
+            let value = &line[server_config.header_connection_prefix.len()..];
+            if contains_ascii_case_insensitive(value, b"close") {
+                keep_alive = false;
+            }
+            if contains_ascii_case_insensitive(value, b"keep-alive") {
+                keep_alive = true;
+            }
+        } else if line.len() >= server_config.header_content_length_prefix.len()
+            && line[..server_config.header_content_length_prefix.len()]
+                .eq_ignore_ascii_case(server_config.header_content_length_prefix.as_slice())
+        {
+            let value =
+                trim_ascii_spaces(&line[server_config.header_content_length_prefix.len()..]);
+            if value != b"0" {
+                has_body = true;
+            }
+        } else if line.len() >= server_config.header_transfer_encoding_prefix.len()
+            && line[..server_config.header_transfer_encoding_prefix.len()]
+                .eq_ignore_ascii_case(server_config.header_transfer_encoding_prefix.as_slice())
+        {
+            let value =
+                trim_ascii_spaces(&line[server_config.header_transfer_encoding_prefix.len()..]);
+            if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
+                has_body = true;
+            }
+        }
+
+        line_start = next_end + 2;
+    }
+
+    Some(ParsedRequest {
+        method: b"GET",
+        target: b"/",
+        path: b"/",
+        keep_alive,
+        header_bytes: header_end + 4,
+        has_body,
+        content_length: None,
+        headers: Vec::new(), // Hot path: no headers needed for static response
+    })
 }
 
 // ─── Routing ──────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
-fn resolve_static_fast_path<'a>(
-    router: &'a Router,
-    parsed: &ParsedRequest<'_>,
-    _server_config: &HttpServerConfig,
-) -> Option<&'a ExactStaticRoute> {
-    if parsed.path == b"/" && parsed.method == b"GET" {
-        return router.exact_get_root();
-    }
-    router.exact_static_route(parsed.method, parsed.path)
-}
+// ─── Bridge Envelope Building (Single-Pass Headers) ───────────────────────────
+//
+// Uses the pre-parsed headers from httparse — no second scan of the raw bytes.
 
 fn build_dispatch_request_owned(
     router: &Router,
@@ -429,9 +832,16 @@ fn build_dispatch_request_owned(
         return Ok(None);
     };
 
-    let path_str = std::str::from_utf8(path).ok().context("Invalid UTF-8 path")?;
-    let url_str = std::str::from_utf8(target).ok().context("Invalid UTF-8 URL")?;
+    let path_str = match std::str::from_utf8(path) {
+        Ok(path_str) => path_str,
+        Err(_) => return Ok(None),
+    };
+    let url_str = match std::str::from_utf8(target) {
+        Ok(url_str) => url_str,
+        Err(_) => return Ok(None),
+    };
 
+    // Security: strict path validation
     let normalized_path = normalize_runtime_path(path_str);
     if contains_path_traversal(&normalized_path) {
         return Ok(None);
@@ -441,8 +851,20 @@ fn build_dispatch_request_owned(
         return Ok(None);
     };
 
-    let header_refs: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-    build_dispatch_envelope(&matched_route, method_code, path_str, url_str, &header_refs, body).map(Some)
+    let header_refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+
+    build_dispatch_envelope(
+        &matched_route,
+        method_code,
+        path_str,
+        url_str,
+        &header_refs,
+        body,
+    )
+    .map(Some)
 }
 
 fn build_dispatch_envelope(
@@ -459,129 +881,318 @@ fn build_dispatch_envelope(
     if url.contains('?') {
         flags |= REQUEST_FLAG_QUERY_PRESENT;
     }
-
-    let mut envelope = Vec::with_capacity(512 + body.len());
-    envelope.push(1); // Version
-    envelope.push(method_code);
-    envelope.extend_from_slice(&(flags).to_le_bytes());
-    envelope.extend_from_slice(&(matched_route.handler_id).to_le_bytes());
-
-    write_usize(&mut envelope, url_bytes.len());
-    envelope.extend_from_slice(url_bytes);
-
-    write_usize(&mut envelope, path_bytes.len());
-    envelope.extend_from_slice(path_bytes);
-
-    write_usize(&mut envelope, matched_route.param_values.len());
-    for val in &matched_route.param_values {
-        write_usize(&mut envelope, val.len());
-        envelope.extend_from_slice(val.as_bytes());
+    if !body.is_empty() {
+        flags |= REQUEST_FLAG_BODY_PRESENT;
     }
 
-    let header_count = matched_route.header_keys.len();
-    write_usize(&mut envelope, header_count);
+    if url_bytes.len() > u32::MAX as usize {
+        return Err(anyhow!("request url too large"));
+    }
+    if path_bytes.len() > u16::MAX as usize {
+        return Err(anyhow!("request path too large"));
+    }
+    if matched_route.param_values.len() > u16::MAX as usize {
+        return Err(anyhow!("too many params"));
+    }
+    let selected_headers = select_header_entries(header_entries, matched_route);
+    if selected_headers.len() > u16::MAX as usize {
+        return Err(anyhow!("too many headers"));
+    }
 
-    for key_boxed in matched_route.header_keys {
-        let key = key_boxed.as_ref();
-        let mut found = false;
-        for (h_name, h_value) in header_entries {
-            if h_name.eq_ignore_ascii_case(key) {
-                write_usize(&mut envelope, h_value.len());
-                envelope.extend_from_slice(h_value.as_bytes());
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            write_usize(&mut envelope, 0);
+    let mut frame = Vec::with_capacity(
+        20 + url_bytes.len() + path_bytes.len() + selected_headers.len() * 16 + body.len(),
+    );
+    frame.push(BRIDGE_VERSION);
+    frame.push(method_code);
+    push_u16(&mut frame, flags);
+    push_u32(&mut frame, matched_route.handler_id);
+    push_u32(&mut frame, url_bytes.len() as u32);
+    push_u16(&mut frame, path_bytes.len() as u16);
+    push_u16(&mut frame, matched_route.param_values.len() as u16);
+    push_u16(&mut frame, selected_headers.len() as u16);
+    push_u32(&mut frame, body.len() as u32); // NEW: body length
+    frame.extend_from_slice(url_bytes);
+    frame.extend_from_slice(path_bytes);
+
+    for value in matched_route.param_values.iter() {
+        push_string_value(&mut frame, value)?;
+    }
+
+    for (name, value) in selected_headers {
+        push_string_pair(&mut frame, name, value)?;
+    }
+
+    frame.extend_from_slice(body); // NEW: body bytes at end
+
+    Ok(Buffer::from(frame))
+}
+
+fn select_header_entries<'a>(
+    header_entries: &[(&'a str, &'a str)],
+    matched_route: &MatchedRoute<'_, '_>,
+) -> Vec<(&'a str, &'a str)> {
+    if matched_route.full_headers {
+        return header_entries.to_vec();
+    }
+
+    if matched_route.header_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::with_capacity(matched_route.header_keys.len());
+    for (name, value) in header_entries {
+        if matched_route
+            .header_keys
+            .iter()
+            .any(|target| target.as_ref().eq_ignore_ascii_case(name))
+        {
+            selected.push((*name, *value));
         }
     }
 
-    // Body support
-    write_usize(&mut envelope, body.len());
-    envelope.extend_from_slice(body);
-
-    Ok(Buffer::from(envelope))
+    selected
 }
 
 // ─── Response Writing ─────────────────────────────────────────────────────────
 
 async fn write_exact_static_response(
     stream: &mut TcpStream,
-    route: &ExactStaticRoute,
+    static_route: &ExactStaticRoute,
     keep_alive: bool,
 ) -> Result<()> {
     let response = if keep_alive {
-        &route.keep_alive_response
+        static_route.keep_alive_response.clone()
     } else {
-        &route.close_response
+        static_route.close_response.clone()
     };
-    let (res, _) = stream.write_all(response.clone()).await;
-    res?;
+
+    let (write_result, _) = stream.write_all(response).await;
+    write_result?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct DispatchResponseEnvelope {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Bytes,
 }
 
 async fn write_dynamic_dispatch_response(
     stream: &mut TcpStream,
     dispatcher: &JsDispatcher,
-    request_buffer: Buffer,
+    request: Buffer,
     keep_alive: bool,
 ) -> Result<()> {
-    let result: Buffer = dispatcher.call_async(request_buffer).await
-        .map_err(|e| anyhow::anyhow!("JS dispatch failed: {e}"))?;
+    let parsed = match dispatcher.dispatch(request).await {
+        Ok(response) => match parse_dispatch_response(response.as_ref()) {
+            Ok(parsed) => parsed,
+            Err(_) => DispatchResponseEnvelope {
+                status: 500,
+                headers: vec![(
+                    "content-type".to_string(),
+                    "application/json; charset=utf-8".to_string(),
+                )],
+                // Security: sanitized error — no internal details
+                body: Bytes::from_static(b"{\"error\":\"Internal Server Error\"}"),
+            },
+        },
+        Err(_) => DispatchResponseEnvelope {
+            status: 502,
+            headers: vec![(
+                "content-type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            )],
+            // Security: sanitized error — no internal details
+            body: Bytes::from_static(b"{\"error\":\"Bad Gateway\"}"),
+        },
+    };
 
-    let (write_res, _) = stream.write_all(result).await;
-    write_res?;
-
+    let response_bytes = build_dispatch_response_bytes(parsed, keep_alive);
+    let (write_result, _) = stream.write_all(response_bytes).await;
+    write_result?;
     Ok(())
 }
 
 async fn write_not_found_response(stream: &mut TcpStream, keep_alive: bool) -> Result<()> {
-    let response = build_error_response_bytes(404, b"{\"error\":\"Not Found\"}", keep_alive);
-    let (res, _) = stream.write_all(response).await;
-    res?;
+    let response = build_response_bytes(
+        404,
+        &[(
+            "content-type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )],
+        Bytes::from_static(NOT_FOUND_BODY),
+        keep_alive,
+    );
+    let (write_result, _) = stream.write_all(response).await;
+    write_result?;
     Ok(())
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
+/// Build a simple error response without going through the JS bridge
 fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 {} {}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: {}\r\n\r\n",
+    build_response_bytes(
         status,
-        status_reason(status),
-        body.len(),
-        if keep_alive { "keep-alive" } else { "close" }
+        &[(
+            "content-type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )],
+        Bytes::copy_from_slice(body),
+        keep_alive,
     )
-    .into_bytes();
-    response.extend_from_slice(body);
-    response
 }
 
-fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
-    if consumed >= buffer.len() {
-        buffer.clear();
-    } else {
-        buffer.drain(..consumed);
-    }
+fn build_dispatch_response_bytes(response: DispatchResponseEnvelope, keep_alive: bool) -> Vec<u8> {
+    build_response_bytes(
+        response.status,
+        &response.headers,
+        response.body,
+        keep_alive,
+    )
 }
 
-fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        431 => "Request Header Fields Too Large",
-        500 => "Internal Server Error",
-        _ => "OK",
+/// Optimized response builder: pre-calculates size and writes in a single pass
+fn build_response_bytes(
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+    keep_alive: bool,
+) -> Vec<u8> {
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let body_len = body.len();
+
+    // Pre-calculate total size to avoid reallocations
+    // "HTTP/1.1 " + status(3) + " " + reason + "\r\n" + "content-length: " + digits + "\r\n" + "connection: " + conn + "\r\n"
+    let mut total_size =
+        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        // Security: skip headers with CRLF injection
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        total_size += name.len() + 2 + value.len() + 2;
     }
+
+    total_size += 2 + body_len; // final \r\n + body
+
+    let mut output = Vec::with_capacity(total_size);
+
+    // Status line
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Mandatory headers
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, body_len);
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // User headers
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(body.as_ref());
+    output
 }
+
+// ─── Response Parsing (from JS bridge) ────────────────────────────────────────
+
+fn parse_dispatch_response(bytes: &[u8]) -> Result<DispatchResponseEnvelope> {
+    let mut offset = 0;
+    let status = read_u16(bytes, &mut offset)?;
+    let header_count = read_u16(bytes, &mut offset)? as usize;
+    let body_length = read_u32(bytes, &mut offset)? as usize;
+
+    let mut headers = Vec::with_capacity(header_count);
+    for _ in 0..header_count {
+        let name_length = read_u8(bytes, &mut offset)? as usize;
+        let value_length = read_u16(bytes, &mut offset)? as usize;
+        let name = read_utf8(bytes, &mut offset, name_length)?;
+        let value = read_utf8(bytes, &mut offset, value_length)?;
+        headers.push((name, value));
+    }
+
+    if offset + body_length > bytes.len() {
+        return Err(anyhow!("response body truncated"));
+    }
+
+    let body = Bytes::copy_from_slice(&bytes[offset..offset + body_length]);
+    Ok(DispatchResponseEnvelope {
+        status,
+        headers,
+        body,
+    })
+}
+
+// ─── Security Utilities ───────────────────────────────────────────────────────
+
+/// Check for path traversal attempts (../, ..\, etc.)
+fn contains_path_traversal(path: &str) -> bool {
+    // Decode percent-encoded dots
+    let decoded = path.replace("%2e", ".").replace("%2E", ".");
+
+    // Check for traversal patterns
+    decoded.contains("/../")
+        || decoded.contains("\\..\\")
+        || decoded.ends_with("/..")
+        || decoded.ends_with("\\..")
+        || decoded.starts_with("../")
+        || decoded.starts_with("..\\")
+        || decoded == ".."
+}
+
+/// RFC 8259 compliant JSON string escaping — handles ALL control characters
+#[allow(dead_code)]
+pub(crate) fn escape_json(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\x08' => output.push_str("\\b"),
+            '\x0C' => output.push_str("\\f"),
+            c if c.is_control() => {
+                output.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => output.push(c),
+        }
+    }
+    output
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
     match method {
@@ -596,20 +1207,49 @@ fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
     }
 }
 
-fn write_usize(output: &mut Vec<u8>, value: usize) {
-    output.extend_from_slice(&(value as u32).to_le_bytes());
-}
-
-fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
-    if path == "/" || !path.ends_with('/') {
-        Cow::Borrowed(path)
-    } else {
-        Cow::Owned(path.trim_end_matches('/').to_string())
+fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
+    if consumed >= buffer.len() {
+        buffer.clear();
+        return;
     }
+
+    let remaining = buffer.len() - consumed;
+    buffer.copy_within(consumed.., 0);
+    buffer.truncate(remaining);
 }
 
-fn contains_path_traversal(path: &str) -> bool {
-    path.contains("/../") || path.contains("\\..\\") || path.ends_with("/..") || path.ends_with("\\..")
+fn bind_listener(
+    options: &NativeListenOptions,
+    server_config: &HttpServerConfig,
+) -> Result<TcpListener> {
+    let host = options
+        .host
+        .as_deref()
+        .unwrap_or(server_config.default_host.as_str());
+    let bind_addr = resolve_socket_addr(host, options.port)
+        .with_context(|| format!("failed to resolve bind address {host}:{}", options.port))?;
+    let listener_opts = ListenerOpts::new()
+        .reuse_addr(true)
+        .reuse_port(true)
+        .backlog(options.backlog.unwrap_or(server_config.default_backlog));
+
+    TcpListener::bind_with_config(bind_addr, &listener_opts)
+        .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
+}
+
+fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("unable to resolve {host}:{port}"))
+}
+
+fn validate_manifest(manifest: &ManifestInput) -> Result<()> {
+    if manifest.version != 1 {
+        return Err(anyhow!("Unsupported manifest version {}", manifest.version));
+    }
+
+    Ok(())
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -617,72 +1257,171 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
-}
-
-fn should_enable_nodelay() -> bool {
-    std::env::var("HTTP_NATIVE_TCP_NODELAY")
-        .ok()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "off" | "no"))
-        .unwrap_or(true)
-}
-
-fn bind_listener(options: &NativeListenOptions, config: &HttpServerConfig) -> Result<TcpListener> {
-    let host = options.host.as_deref().unwrap_or(&config.default_host);
-    let addr = (host, options.port).to_socket_addrs()?.next()
-        .ok_or_else(|| anyhow::anyhow!("Failed to resolve address {host}:{}", options.port))?;
-
-    let mut opts = monoio::net::ListenerOpts::new()
-        .reuse_addr(true)
-        .backlog(options.backlog.unwrap_or(config.default_backlog));
-    
-    if worker_count_for(options) > 1 {
-        opts = opts.reuse_port(true);
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
     }
 
-    TcpListener::bind_with_config(addr, &opts)
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn worker_count_for(options: &NativeListenOptions) -> usize {
-    options.workers.unwrap_or_else(num_cpus::get)
+fn trim_ascii_spaces(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
 }
 
-// ─── NAPI Glue ────────────────────────────────────────────────────────────────
+fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
+    if path == "/" || !path.ends_with('/') {
+        return Cow::Borrowed(path);
+    }
 
-#[napi(object)]
-#[derive(Clone, Default)]
-pub struct NativeListenOptions {
-    pub host: Option<String>,
-    pub port: u16,
-    pub backlog: Option<i32>,
-    pub workers: Option<usize>,
+    Cow::Owned(crate::analyzer::normalize_path(path))
 }
 
-#[napi]
-pub struct ServerHandle {
-    workers: Vec<thread::JoinHandle<()>>,
+fn config_string(
+    input: Option<&HttpServerConfigInput>,
+    pick: impl Fn(&HttpServerConfigInput) -> Option<&str>,
+    fallback: &str,
+) -> String {
+    input.and_then(pick).unwrap_or(fallback).to_string()
 }
 
-#[napi]
-impl ServerHandle {
-    #[napi]
-    pub fn close(&mut self) {
-        // In a real implementation, we'd send a shutdown signal.
-        // For now, we just let them drop or kill the process.
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "OK",
     }
 }
 
-impl HttpServerConfig {
-    fn from_input(input: Option<&HttpServerConfigInput>) -> Self {
-        Self {
-            default_host: input.and_then(|i| i.default_host.clone()).unwrap_or_else(|| "127.0.0.1".to_string()),
-            default_backlog: input.and_then(|i| i.default_backlog).unwrap_or(2048),
-            max_header_bytes: input.and_then(|i| i.max_header_bytes).unwrap_or(8192),
-            hot_get_root_http11: b"GET / HTTP/1.1\r\n".to_vec(),
-            hot_get_root_http10: b"GET / HTTP/1.0\r\n".to_vec(),
-            header_connection_prefix: b"connection:".to_vec(),
-            header_content_length_prefix: b"content-length:".to_vec(),
-            header_transfer_encoding_prefix: b"transfer-encoding:".to_vec(),
-        }
+/// Fast integer-to-string for small values — uses stack-allocated itoa buffer
+#[inline(always)]
+fn write_usize(output: &mut Vec<u8>, value: usize) {
+    let mut buf = itoa::Buffer::new();
+    output.extend_from_slice(buf.format(value).as_bytes());
+}
+
+#[inline(always)]
+fn write_u16(output: &mut Vec<u8>, value: u16) {
+    let mut buf = itoa::Buffer::new();
+    output.extend_from_slice(buf.format(value).as_bytes());
+}
+
+fn count_digits(mut n: usize) -> usize {
+    if n == 0 {
+        return 1;
     }
+    let mut count = 0;
+    while n > 0 {
+        count += 1;
+        n /= 10;
+    }
+    count
+}
+
+fn push_string_pair(frame: &mut Vec<u8>, name: &str, value: &str) -> Result<()> {
+    if name.len() > u8::MAX as usize {
+        return Err(anyhow!("field name too long"));
+    }
+    if value.len() > u16::MAX as usize {
+        return Err(anyhow!("field value too long"));
+    }
+
+    frame.push(name.len() as u8);
+    push_u16(frame, value.len() as u16);
+    frame.extend_from_slice(name.as_bytes());
+    frame.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn push_string_value(frame: &mut Vec<u8>, value: &str) -> Result<()> {
+    if value.len() > u16::MAX as usize {
+        return Err(anyhow!("field value too long"));
+    }
+
+    push_u16(frame, value.len() as u16);
+    frame.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn push_u16(frame: &mut Vec<u8>, value: u16) {
+    frame.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(frame: &mut Vec<u8>, value: u32) {
+    frame.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_u8(bytes: &[u8], offset: &mut usize) -> Result<u8> {
+    if *offset + 1 > bytes.len() {
+        return Err(anyhow!("response envelope truncated"));
+    }
+
+    let value = bytes[*offset];
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
+    if *offset + 2 > bytes.len() {
+        return Err(anyhow!("response envelope truncated"));
+    }
+
+    let value = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]);
+    *offset += 2;
+    Ok(value)
+}
+
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    if *offset + 4 > bytes.len() {
+        return Err(anyhow!("response envelope truncated"));
+    }
+
+    let value = u32::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_utf8(bytes: &[u8], offset: &mut usize, length: usize) -> Result<String> {
+    if *offset + length > bytes.len() {
+        return Err(anyhow!("response envelope truncated"));
+    }
+
+    let value = std::str::from_utf8(&bytes[*offset..*offset + length])
+        .context("response envelope contained invalid utf-8")?
+        .to_string();
+    *offset += length;
+    Ok(value)
+}
+
+fn to_napi_error<E>(error: E) -> Error
+where
+    E: std::fmt::Display,
+{
+    Error::from_reason(error.to_string())
 }

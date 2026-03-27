@@ -8,4 +8,4 @@ http-native-bin-arm-mac.zip
 .http-native/
 additions.md
 old/
-opt/
+#opt/

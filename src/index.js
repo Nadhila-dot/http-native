@@ -14,7 +14,7 @@ import { loadNativeModule } from "./native.js";
 import defaultHttpServerConfig, {
   normalizeHttpServerConfig,
 } from "./http-server.config.js";
-import { createRuntimeOptimizer } from "../opt/runtime.js";
+import { createRuntimeOptimizer } from "./opt/runtime.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
@@ -796,6 +796,7 @@ export function createApp() {
         },
         close() {
           ACTIVE_NATIVE_SERVERS.delete(handle);
+          runtimeOptimizer?.dispose?.();
           return handle.close();
         },
       };

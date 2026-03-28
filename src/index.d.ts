@@ -99,6 +99,15 @@ export interface HttpServerConfig {
   maxHeaderBytes?: number;
 }
 
+export interface RuntimeOptimizationOptions {
+  /** Emit optimization and live-hit logs */
+  notify?: boolean;
+  /** Live notify interval in milliseconds (default: 1000) */
+  notifyIntervalMs?: number;
+  /** Enable runtime response cache promotion for deterministic routes */
+  cache?: boolean;
+}
+
 export interface ListenOptions {
   /** Host to bind to (default: "127.0.0.1") */
   host?: string;
@@ -113,7 +122,7 @@ export interface ListenOptions {
   serverConfig?: HttpServerConfig;
 
   /** Runtime optimization options */
-  opt?: Record<string, unknown>;
+  opt?: RuntimeOptimizationOptions;
 }
 
 // ─── Server Handle ──────────────────────

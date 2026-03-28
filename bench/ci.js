@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
-const DEFAULT_ENGINES = ["http-native", "bun", "fiber"];
+const DEFAULT_ENGINES = ["http-native", "bun"];
 const DEFAULT_SCENARIOS = ["static", "dynamic", "opt"];
 const DEFAULT_CONNECTIONS = 200;
 const DEFAULT_DURATION = "10s";
@@ -158,7 +158,7 @@ function printUsage() {
   console.log("Usage: bun bench/ci.js [options]");
   console.log("");
   console.log("Options:");
-  console.log(`  --engines=http-native,bun,fiber   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
+  console.log(`  --engines=http-native,bun   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
   console.log(`  --scenarios=static,dynamic,opt   Comma-separated list. Default: ${DEFAULT_SCENARIOS.join(",")}`);
   console.log(`  --connections=${DEFAULT_CONNECTIONS}   Bombardier concurrency`);
   console.log(`  --duration=${DEFAULT_DURATION}   Bombardier duration`);

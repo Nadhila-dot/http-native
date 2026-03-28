@@ -161,6 +161,9 @@ export interface Application {
   use(middleware: Middleware): Application;
   use(path: string, middleware: Middleware): Application;
 
+  /** Register a global error / not-found handler */
+  error(handler: ErrorHandler): Application;
+
   /** Register a global error handler */
   onError(handler: ErrorHandler): Application;
 

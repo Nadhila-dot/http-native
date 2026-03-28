@@ -119,8 +119,34 @@ async function main() {
     },
   };
   const chainOrder = [];
+  const observedErrors = [];
 
   const app = createApp();
+  assert.equal(typeof app.error, "function");
+
+  app.error((error, req, res) => {
+    observedErrors.push({
+      path: req.path,
+      status: Number(error?.status ?? 500),
+      code: error?.code ?? null,
+      message: error?.message ?? "",
+    });
+
+    if (Number(error?.status) === 404) {
+      res.status(404).json({
+        handled: true,
+        path: req.path,
+        code: error.code,
+      });
+      return;
+    }
+
+    res.status(Number(error?.status ?? 500)).json({
+      handled: true,
+      path: req.path,
+      message: error?.message ?? "unknown",
+    });
+  });
 
   app.use("/users", async (req, res, next) => {
     res.header("x-powered-by", "http-native");
@@ -190,6 +216,10 @@ async function main() {
 
   app.get("/empty", (req, res) => {
     res.status(204).send();
+  });
+
+  app.get("/explode", () => {
+    throw new Error("boom");
   });
 
   const server = await app.listen({
@@ -302,6 +332,41 @@ async function main() {
       accept: "application/json",
       q: "safe",
     });
+
+    const notFoundResponse = await fetch(new URL("/missing?q=nope", server.url), {
+      headers: {
+        accept: "application/json",
+      },
+    });
+    assert.equal(notFoundResponse.status, 404);
+    assert.deepEqual(await notFoundResponse.json(), {
+      handled: true,
+      path: "/missing",
+      code: "NOT_FOUND",
+    });
+
+    const explodedResponse = await fetch(new URL("/explode", server.url));
+    assert.equal(explodedResponse.status, 500);
+    assert.deepEqual(await explodedResponse.json(), {
+      handled: true,
+      path: "/explode",
+      message: "boom",
+    });
+
+    assert.deepEqual(observedErrors, [
+      {
+        path: "/missing",
+        status: 404,
+        code: "NOT_FOUND",
+        message: "Route not found",
+      },
+      {
+        path: "/explode",
+        status: 500,
+        code: null,
+        message: "boom",
+      },
+    ]);
 
     for (let index = 0; index < 32; index += 1) {
       const stableResponse = await fetch(new URL("/stable", server.url));

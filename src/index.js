@@ -8,6 +8,7 @@ import {
   decodeRequestEnvelope,
   encodeResponseEnvelope,
   mergeRequestAccessPlans,
+  releaseRequestObject,
 } from "./bridge.js";
 import { loadNativeModule } from "./native.js";
 import defaultHttpServerConfig, {
@@ -18,6 +19,19 @@ import { createRuntimeOptimizer } from "../opt/runtime.js";
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
+const ERROR_REQUEST_PLAN = Object.freeze({
+  method: true,
+  path: true,
+  url: true,
+  fullParams: false,
+  fullQuery: true,
+  fullHeaders: true,
+  paramKeys: new Set(),
+  queryKeys: new Set(),
+  headerKeys: new Set(),
+  dispatchKind: "generic_fallback",
+  jsonFastPath: "fallback",
+});
 
 // ─── Path Normalization ───────────────────────────────────────────────────────
 
@@ -66,7 +80,7 @@ function normalizeContentType(type) {
   return type;
 }
 
-// ─── Response Envelope (Pooled) ───────────────────────────────────────────────
+
 
 const RESPONSE_POOL_MAX = 512;
 const responsePool = [];
@@ -268,29 +282,92 @@ function createMiddlewareRunner(middlewares) {
 
 // ─── Error Handling (Security-Hardened) ───────────────────────────────────────
 
-function serializeErrorResponse(error) {
-  // Security: NEVER leak internal error details to the client
-  const isProduction = process.env.NODE_ENV === "production";
-  const body = isProduction
-    ? { error: "Internal Server Error" }
-    : {
-        error: "Internal Server Error",
-        detail: error instanceof Error ? error.message : String(error),
-      };
+function normalizeErrorStatus(error, fallbackStatus = 500) {
+  const status = Number(error?.status ?? error?.statusCode ?? fallbackStatus);
+  return Number.isInteger(status) && status >= 400 && status <= 599
+    ? status
+    : fallbackStatus;
+}
 
-  return encodeResponseEnvelope({
-    status: 500,
+function createHttpError(status, message, code) {
+  const error = new Error(message);
+  error.status = status;
+  if (code) {
+    error.code = code;
+  }
+  return error;
+}
+
+function buildDefaultErrorSnapshot(error, fallbackStatus = 500) {
+  // Security: NEVER leak internal error details to the client
+  const status = normalizeErrorStatus(error, fallbackStatus);
+  const isProduction = process.env.NODE_ENV === "production";
+  let body;
+
+  if (status === 404) {
+    body = {
+      error: error?.message || "Route not found",
+    };
+  } else if (status >= 500) {
+    body = isProduction
+      ? { error: "Internal Server Error" }
+      : {
+          error: "Internal Server Error",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+  } else {
+    body = {
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : `HTTP ${status}`,
+    };
+  }
+
+  return {
+    status,
     headers: {
       "content-type": "application/json; charset=utf-8",
     },
     body: Buffer.from(JSON.stringify(body), "utf8"),
-  });
+  };
+}
+
+function serializeErrorResponse(error, fallbackStatus = 500) {
+  return encodeResponseEnvelope(buildDefaultErrorSnapshot(error, fallbackStatus));
 }
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 
 function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
+  const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
+
+  async function finalizeError(error, req, res, snapshot, release, fallbackStatus = 500) {
+    try {
+      if (!res.finished) {
+        for (const errorHandler of errorHandlers) {
+          await errorHandler(error, req, res);
+          if (res.finished) {
+            break;
+          }
+        }
+      }
+
+      if (!res.finished) {
+        return encodeResponseEnvelope(buildDefaultErrorSnapshot(error, fallbackStatus));
+      }
+
+      return encodeResponseEnvelope(snapshot());
+    } catch (handlerError) {
+      return serializeErrorResponse(handlerError);
+    } finally {
+      if (req) {
+        releaseRequestObject(req);
+      }
+      release();
+    }
+  }
 
   return async function dispatch(requestBuffer) {
     let decoded;
@@ -299,6 +376,19 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
       decoded = decodeRequestEnvelope(requestBuffer);
     } catch (error) {
       return serializeErrorResponse(error);
+    }
+
+    if (decoded.handlerId === 0) {
+      const req = errorRequestFactory(decoded);
+      const { response: res, snapshot, release } = createResponseEnvelope();
+      return finalizeError(
+        createHttpError(404, "Route not found", "NOT_FOUND"),
+        req,
+        res,
+        snapshot,
+        release,
+        404,
+      );
     }
 
     const route = routesById.get(decoded.handlerId);
@@ -315,32 +405,13 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
         await route.compiledHandler(req, res);
       }
     } catch (error) {
-      if (!res.finished) {
-        // Try registered error handlers first
-        for (const errorHandler of errorHandlers) {
-          try {
-            await errorHandler(error, req, res);
-            if (res.finished) {
-              break;
-            }
-          } catch (handlerError) {
-            // Error handler itself threw — fall through to default
-            release();
-            return serializeErrorResponse(handlerError);
-          }
-        }
-
-        // If no error handler responded, use default
-        if (!res.finished) {
-          release();
-          return serializeErrorResponse(error);
-        }
-      }
+      return finalizeError(error, req, res, snapshot, release, 500);
     }
 
     const responseSnapshot = snapshot();
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
     const encoded = encodeResponseEnvelope(responseSnapshot);
+    releaseRequestObject(req);
     release();
     return encoded;
   };
@@ -469,6 +540,10 @@ export function createApp() {
       }
       this._errorHandlers.push(handler);
       return this;
+    },
+
+    error(handler) {
+      return this.onError(handler);
     },
 
     get: undefined,

@@ -192,7 +192,7 @@ function acquireRequestObject() {
   return requestPool.pop() || null;
 }
 
-function releaseRequestObject(req) {
+export function releaseRequestObject(req) {
   if (requestPool.length >= REQUEST_POOL_MAX) {
     return;
   }
@@ -353,6 +353,27 @@ function createPooledRequest() {
   return req;
 }
 
+function methodNameFromCode(methodCode) {
+  switch (methodCode) {
+    case METHOD_CODES.GET:
+      return "GET";
+    case METHOD_CODES.POST:
+      return "POST";
+    case METHOD_CODES.PUT:
+      return "PUT";
+    case METHOD_CODES.DELETE:
+      return "DELETE";
+    case METHOD_CODES.PATCH:
+      return "PATCH";
+    case METHOD_CODES.OPTIONS:
+      return "OPTIONS";
+    case METHOD_CODES.HEAD:
+      return "HEAD";
+    default:
+      return "";
+  }
+}
+
 export function createRequestFactory(
   plan,
   routeParamNames = EMPTY_ARRAY,
@@ -369,7 +390,7 @@ export function createRequestFactory(
     request._routeParamNames = routeParamNames;
     request._plan = plan;
     request._routeMethod = routeMethod;
-    request.method = routeMethod;
+    request.method = routeMethod ?? methodNameFromCode(decoded.methodCode);
     request._path = undefined;
     request._url = undefined;
     request._params = undefined;

@@ -407,7 +407,11 @@ fn build_response_bytes(
 
     for (name, value) in headers {
         // Security: skip headers with CRLF injection
-        if name.contains('\r') || name.contains('\n') || value.contains('\r') || value.contains('\n') {
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
             continue;
         }
         response.extend_from_slice(name.as_bytes());

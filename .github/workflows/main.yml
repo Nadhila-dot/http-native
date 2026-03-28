@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       engines:
-        description: 'Comma-separated engines to benchmark. Supported by this workflow: "http-native,bun"'
+        description: 'Comma-separated engines to benchmark. Supported by this workflow: "http-native,bun,fiber"'
         required: false
-        default: "http-native,bun"
+        default: "http-native,bun,fiber"
       scenarios:
         description: 'Comma-separated scenarios: "static,dynamic,opt"'
         required: false
@@ -62,7 +62,7 @@ jobs:
       - name: Run benchmarks
         run: |
           bun bench/ci.js \
-            --engines="${{ github.event.inputs.engines || 'http-native,bun' }}" \
+            --engines="${{ github.event.inputs.engines || 'http-native,bun,fiber' }}" \
             --scenarios="${{ github.event.inputs.scenarios || 'static,dynamic,opt' }}" \
             --connections="${{ github.event.inputs.connections || '200' }}" \
             --duration="${{ github.event.inputs.duration || '10s' }}" \

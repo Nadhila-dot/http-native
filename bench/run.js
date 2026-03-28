@@ -9,7 +9,7 @@ const port = Number(portArg ?? 3001);
 
 function printUsage() {
   console.log("Usage: bun bench/run.js <engine> <scenario> <port>");
-  console.log("Engines: http-native | bun | xitca | monoio | zig");
+  console.log("Engines: http-native | bun | fiber | xitca | monoio | zig");
   console.log("Scenarios: static | dynamic | opt");
   console.log("");
   console.log("Example:");
@@ -30,7 +30,7 @@ function benchmarkPathForScenario(activeScenario) {
 }
 
 async function main() {
-  if (!["http-native", "bun", "xitca", "monoio", "zig"].includes(engine)) {
+  if (!["http-native", "bun", "fiber", "xitca", "monoio", "zig"].includes(engine)) {
     printUsage();
     process.exit(1);
   }
@@ -69,6 +69,11 @@ async function main() {
             stdio: ["ignore", "pipe", "inherit"],
           },
         )
+        : engine === "fiber"
+          ? spawn("go", ["run", "./bench/fiber-server", scenario, String(port)], {
+            cwd: process.cwd(),
+            stdio: ["ignore", "pipe", "inherit"],
+          })
         : spawn("bun", ["bench/target.js", engine, scenario, String(port)], {
           cwd: process.cwd(),
           stdio: ["ignore", "pipe", "inherit"],

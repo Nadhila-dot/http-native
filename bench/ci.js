@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
-const DEFAULT_ENGINES = ["http-native", "bun"];
+const DEFAULT_ENGINES = ["http-native", "bun", "fiber"];
 const DEFAULT_SCENARIOS = ["static", "dynamic", "opt"];
 const DEFAULT_CONNECTIONS = 200;
 const DEFAULT_DURATION = "10s";
@@ -20,6 +20,7 @@ const SERVER_PORTS = Object.freeze({
   xitca: { static: 3003, dynamic: 3013, opt: 3023 },
   monoio: { static: 3004, dynamic: 3014, opt: 3024 },
   zig: { static: 3005, dynamic: 3015, opt: 3025 },
+  fiber: { static: 3009, dynamic: 3019, opt: 3029 },
 });
 
 const SUPPORTED_SCENARIOS = new Set(DEFAULT_SCENARIOS);
@@ -143,7 +144,7 @@ function printUsage() {
   console.log("Usage: bun bench/ci.js [options]");
   console.log("");
   console.log("Options:");
-  console.log(`  --engines=http-native,bun   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
+  console.log(`  --engines=http-native,bun,fiber   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
   console.log(`  --scenarios=static,dynamic,opt   Comma-separated list. Default: ${DEFAULT_SCENARIOS.join(",")}`);
   console.log(`  --connections=${DEFAULT_CONNECTIONS}   Bombardier concurrency`);
   console.log(`  --duration=${DEFAULT_DURATION}   Bombardier duration`);
@@ -315,6 +316,18 @@ function spawnServer(testCase) {
   if (testCase.engine === "bun" || testCase.engine === "http-native" || testCase.engine === "old") {
     return spawn("bun", ["bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
       cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
+  if (testCase.engine === "fiber") {
+    const cwd = resolve(process.cwd(), "bench/fiber-server");
+    if (!existsSync(resolve(cwd, "go.mod"))) {
+      throw new Error(`Missing Fiber benchmark target at ${cwd}`);
+    }
+
+    return spawn("go", ["run", ".", testCase.scenario, String(testCase.port)], {
+      cwd,
       stdio: ["ignore", "pipe", "pipe"],
     });
   }

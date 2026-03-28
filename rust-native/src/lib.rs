@@ -21,6 +21,7 @@ use crate::manifest::{HttpServerConfigInput, ManifestInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
+// Gotta add support for these to be changed.
 
 const FALLBACK_DEFAULT_HOST: &str = "127.0.0.1";
 const FALLBACK_DEFAULT_BACKLOG: i32 = 2048;
@@ -33,6 +34,7 @@ const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
 const BRIDGE_VERSION: u8 = 1;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
 const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
+const NOT_FOUND_HANDLER_ID: u32 = 0;
 const NOT_FOUND_BODY: &[u8] = br#"{"error":"Route not found"}"#;
 
 /// Security: Maximum number of headers we allow per request
@@ -847,14 +849,21 @@ fn build_dispatch_request_owned(
         return Ok(None);
     }
 
-    let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
-        return Ok(None);
-    };
-
     let header_refs: Vec<(&str, &str)> = headers
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
+
+    let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &header_refs,
+            body,
+        )
+        .map(Some);
+    };
 
     build_dispatch_envelope(
         &matched_route,
@@ -865,6 +874,56 @@ fn build_dispatch_request_owned(
         body,
     )
     .map(Some)
+}
+
+fn build_not_found_dispatch_envelope(
+    method_code: u8,
+    path: &str,
+    url: &str,
+    header_entries: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Buffer> {
+    let url_bytes = url.as_bytes();
+    let path_bytes = path.as_bytes();
+    let mut flags: u16 = 0;
+    if url.contains('?') {
+        flags |= REQUEST_FLAG_QUERY_PRESENT;
+    }
+    if !body.is_empty() {
+        flags |= REQUEST_FLAG_BODY_PRESENT;
+    }
+
+    if url_bytes.len() > u32::MAX as usize {
+        return Err(anyhow!("request url too large"));
+    }
+    if path_bytes.len() > u16::MAX as usize {
+        return Err(anyhow!("request path too large"));
+    }
+    if header_entries.len() > u16::MAX as usize {
+        return Err(anyhow!("too many headers"));
+    }
+
+    let mut frame = Vec::with_capacity(
+        20 + url_bytes.len() + path_bytes.len() + header_entries.len() * 16 + body.len(),
+    );
+    frame.push(BRIDGE_VERSION);
+    frame.push(method_code);
+    push_u16(&mut frame, flags);
+    push_u32(&mut frame, NOT_FOUND_HANDLER_ID);
+    push_u32(&mut frame, url_bytes.len() as u32);
+    push_u16(&mut frame, path_bytes.len() as u16);
+    push_u16(&mut frame, 0);
+    push_u16(&mut frame, header_entries.len() as u16);
+    push_u32(&mut frame, body.len() as u32);
+    frame.extend_from_slice(url_bytes);
+    frame.extend_from_slice(path_bytes);
+
+    for (name, value) in header_entries {
+        push_string_pair(&mut frame, name, value)?;
+    }
+
+    frame.extend_from_slice(body);
+    Ok(Buffer::from(frame))
 }
 
 fn build_dispatch_envelope(

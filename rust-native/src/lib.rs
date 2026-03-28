@@ -34,6 +34,8 @@ const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
 const BRIDGE_VERSION: u8 = 1;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
 const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
+/// Sentinel handler ID dispatched to JS when no route matches — JS treats this as 404.
+const NOT_FOUND_HANDLER_ID: u32 = 0;
 // Pre-built 404 responses — zero allocation per request
 const NOT_FOUND_RESPONSE_KEEP_ALIVE: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 27\r\nconnection: keep-alive\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"error\":\"Route not found\"}";
 const NOT_FOUND_RESPONSE_CLOSE: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 27\r\nconnection: close\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"error\":\"Route not found\"}";
@@ -868,7 +870,14 @@ fn build_dispatch_request_zero_copy(
     }
 
     let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
-        return Ok(None);
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &parsed.headers,
+            body,
+        )
+        .map(Some);
     };
 
     build_dispatch_envelope(

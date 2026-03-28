@@ -3,7 +3,7 @@ const ANSI = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
   dim: "\x1b[2m",
-  
+
   // Foreground colors
   black: "\x1b[30m",
   red: "\x1b[31m",
@@ -16,12 +16,18 @@ const ANSI = {
   gray: "\x1b[90m",
   
   // Background colors
+  bgBlack: "\x1b[40m",
   bgRed: "\x1b[41m",
   bgGreen: "\x1b[42m",
   bgYellow: "\x1b[43m",
   bgBlue: "\x1b[44m",
   bgMagenta: "\x1b[45m",
   bgCyan: "\x1b[46m",
+};
+
+const ANSI_256 = {
+  fg: (code) => `\x1b[38;5;${code}m`,
+  bg: (code) => `\x1b[48;5;${code}m`,
 };
 
 // Log level styles mimicking cat-loggr
@@ -50,10 +56,12 @@ function getTimestamp() {
 function formatLog(level, message) {
   const style = LOG_LEVELS[level] || LOG_LEVELS.info;
   const timestamp = getTimestamp();
-  const badge = `${style.bg}${style.fg} ${pad(style.label.length)} ${style.label} ${style.label.length === 5 ? "" : " "}${ANSI.reset}`;
-  const spacer = `${ANSI.dim}${ANSI.gray}|${ANSI.reset}`;
-  
-  return `  ${ANSI.dim}${timestamp}${ANSI.reset}  ${badge}  ${message}`;
+
+  const timestampBadge = `${ANSI_256.bg(229)}${ANSI_256.fg(238)} ${timestamp} ${ANSI.reset}`;
+  const levelBadge = `${style.bg}${style.fg} ${style.label.padEnd(7, " ")} ${ANSI.reset}`;
+  const separator = `${ANSI.dim}${ANSI_256.fg(245)}||${ANSI.reset}`;
+
+  return `${timestampBadge}${levelBadge} ${separator} ${message}`;
 }
 
 function log(level, message) {

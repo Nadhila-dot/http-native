@@ -8,18 +8,14 @@ app.error(async (error, req, res) => {
 });
 
 app.get("/", (req, res) => {
-
-    res.json({
+    res.status(200).json({
         ok: true,
         data: req.query,
     });
 });
 
-
-
 const server = await app.listen({
     port: 8190,
-    
     opt: { notify: true}
 });
 

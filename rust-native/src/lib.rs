@@ -1252,6 +1252,7 @@ enum ResolvedDynamicValue {
     Missing,
     Single(String),
     Multi(Vec<String>),
+    RawJson(Vec<u8>),
 }
 
 fn build_dynamic_fast_path_response(
@@ -1334,6 +1335,14 @@ fn render_dynamic_json_body(
                                 output.push(b']');
                                 wrote_field = true;
                             }
+                            ResolvedDynamicValue::RawJson(raw) => {
+                                if wrote_field {
+                                    output.push(b',');
+                                }
+                                output.extend_from_slice(field.key_prefix.as_ref());
+                                output.extend_from_slice(raw.as_slice());
+                                wrote_field = true;
+                            }
                         }
                     }
                 }
@@ -1373,6 +1382,9 @@ fn render_dynamic_text_body(
                         output.push_str(value.as_str());
                     }
                 }
+                ResolvedDynamicValue::RawJson(bytes) => {
+                    output.push_str(String::from_utf8_lossy(bytes.as_slice()).as_ref());
+                }
             },
         }
     }
@@ -1403,6 +1415,10 @@ fn resolve_dynamic_value(
         DynamicValueSourceKind::Query => {
             let entries = query_entries(url, query_cache);
             lookup_query_value(entries.as_slice(), source.key.as_ref())
+        }
+        DynamicValueSourceKind::QueryObject => {
+            let entries = query_entries(url, query_cache);
+            ResolvedDynamicValue::RawJson(serialize_query_object_json(entries.as_slice()))
         }
     }
 }
@@ -1457,6 +1473,65 @@ fn lookup_query_value(entries: &[(String, String)], key: &str) -> ResolvedDynami
         1 => ResolvedDynamicValue::Single(values.pop().unwrap_or_default()),
         _ => ResolvedDynamicValue::Multi(values),
     }
+}
+
+fn serialize_query_object_json(entries: &[(String, String)]) -> Vec<u8> {
+    let mut buckets: Vec<(&str, Vec<&str>)> = Vec::new();
+
+    for (entry_key, entry_value) in entries.iter() {
+        if is_dangerous_query_key(entry_key.as_str()) {
+            continue;
+        }
+
+        if let Some((_, values)) = buckets
+            .iter_mut()
+            .find(|(key, _)| *key == entry_key.as_str())
+        {
+            values.push(entry_value.as_str());
+        } else {
+            buckets.push((entry_key.as_str(), vec![entry_value.as_str()]));
+        }
+    }
+
+    let mut output = Vec::with_capacity(entries.len() * 24 + 16);
+    output.push(b'{');
+
+    for (index, (key, values)) in buckets.iter().enumerate() {
+        if index > 0 {
+            output.push(b',');
+        }
+
+        append_json_string(&mut output, key);
+        output.push(b':');
+        if values.len() == 1 {
+            append_json_string(&mut output, values[0]);
+        } else {
+            output.push(b'[');
+            for (value_index, value) in values.iter().enumerate() {
+                if value_index > 0 {
+                    output.push(b',');
+                }
+                append_json_string(&mut output, value);
+            }
+            output.push(b']');
+        }
+    }
+
+    output.push(b'}');
+    output
+}
+
+fn is_dangerous_query_key(key: &str) -> bool {
+    matches!(
+        key,
+        "__proto__"
+            | "constructor"
+            | "prototype"
+            | "__defineGetter__"
+            | "__defineSetter__"
+            | "__lookupGetter__"
+            | "__lookupSetter__"
+    )
 }
 
 fn append_json_string(output: &mut Vec<u8>, value: &str) {

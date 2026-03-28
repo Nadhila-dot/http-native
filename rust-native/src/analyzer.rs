@@ -67,6 +67,7 @@ pub struct DynamicValueSource {
 pub enum DynamicValueSourceKind {
     Param,
     Query,
+    QueryObject,
     Header,
 }
 
@@ -480,7 +481,7 @@ fn parse_json_object_fields(payload: &str) -> Option<Vec<JsonObjectField>> {
         let separator = find_top_level(trimmed, ':')?;
         let key = parse_object_key(trimmed[..separator].trim())?;
         let value_source = trimmed[separator + 1..].trim();
-        let value = if let Some(source) = parse_dynamic_value_source(value_source) {
+        let value = if let Some(source) = parse_dynamic_json_value_source(value_source) {
             JsonValueTemplate::Dynamic(source)
         } else {
             let literal = parse_literal(value_source)?;
@@ -684,6 +685,18 @@ fn parse_dynamic_value_source(raw: &str) -> Option<DynamicValueSource> {
     }
 
     None
+}
+
+fn parse_dynamic_json_value_source(raw: &str) -> Option<DynamicValueSource> {
+    let source = raw.trim();
+    if source == "req.query" {
+        return Some(DynamicValueSource {
+            kind: DynamicValueSourceKind::QueryObject,
+            key: Box::<str>::from(""),
+        });
+    }
+
+    parse_dynamic_value_source(source)
 }
 
 fn parse_function_call_string_arg(source: &str, prefix: &str) -> Option<String> {

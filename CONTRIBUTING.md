@@ -2,10 +2,10 @@
 
 When commiting code please mention what type of commit it is via the prefix. Example,
 
-opt: This flag is used to show optimizations
-chore: Fix / chore
-rm: removal
-other: Everything else.
+opt: This flag is used to show optimizations <br/>
+chore: Fix / chore <br/>
+rm: removal <br/>
+other: Everything else. <br/>
 
 A commit would like this,
 

@@ -25,7 +25,7 @@ use crate::analyzer::{
 use crate::manifest::{HttpServerConfigInput, ManifestInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────
 // Gotta add support for these to be changed.
 
 const FALLBACK_DEFAULT_HOST: &str = "127.0.0.1";
@@ -39,11 +39,9 @@ const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
 const BRIDGE_VERSION: u8 = 1;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
 const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
+const UNKNOWN_METHOD_CODE: u8 = 0;
 /// Sentinel handler ID dispatched to JS when no route matches — JS treats this as 404.
 const NOT_FOUND_HANDLER_ID: u32 = 0;
-// Pre-built 404 responses — zero allocation per request
-const NOT_FOUND_RESPONSE_KEEP_ALIVE: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 27\r\nconnection: keep-alive\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"error\":\"Route not found\"}";
-const NOT_FOUND_RESPONSE_CLOSE: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 27\r\nconnection: close\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"error\":\"Route not found\"}";
 
 /// Security: Maximum number of headers we allow per request
 const MAX_HEADER_COUNT: usize = 64;
@@ -63,7 +61,7 @@ const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
 
 type DispatchTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, Status, false, false, 0>;
 
-// ─── Thread-Local Buffer Pool ─────────────────────────────────────────────────
+// ─── Thread-Local Buffer Pool ───────────
 //
 // Eliminates per-connection Vec<u8> allocations by recycling buffers.
 
@@ -92,7 +90,7 @@ fn release_buffer(mut buf: Vec<u8>) {
     });
 }
 
-// ─── Server Configuration ─────────────────────────────────────────────────────
+// ─── Server Configuration ───────────────
 
 #[derive(Clone)]
 struct HttpServerConfig {
@@ -170,7 +168,7 @@ impl HttpServerConfig {
     }
 }
 
-// ─── NAPI Interface ───────────────────────────────────────────────────────────
+// ─── NAPI Interface ─────────────────────
 
 #[napi(object)]
 pub struct NativeListenOptions {
@@ -368,7 +366,7 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
         .unwrap_or(1)
 }
 
-// ─── JS Dispatcher ────────────────────────────────────────────────────────────
+// ─── JS Dispatcher ──────────────────────
 
 struct JsDispatcher {
     callback: DispatchTsfn,
@@ -388,7 +386,7 @@ impl JsDispatcher {
     }
 }
 
-// ─── Server Loop ──────────────────────────────────────────────────────────────
+// ─── Server Loop ────────────────────────
 
 async fn run_server(
     listener: TcpListener,
@@ -437,7 +435,7 @@ async fn run_server(
     Ok(())
 }
 
-// ─── Parsed Request (from httparse) ───────────────────────────────────────────
+// ─── Parsed Request (from httparse) ─────
 
 struct ParsedRequest<'a> {
     method: &'a [u8],
@@ -451,7 +449,7 @@ struct ParsedRequest<'a> {
     headers: Vec<(&'a str, &'a str)>,
 }
 
-// ─── Connection Handler with Buffer Pool ──────────────────────────────────────
+// ─── Connection Handler with Buffer Pool 
 
 async fn handle_connection(
     mut stream: TcpStream,
@@ -573,9 +571,6 @@ async fn handle_connection_inner(
                     let (write_result, _) = stream.write_all(response).await;
                     write_result?;
                 }
-                DispatchDecision::NotFound => {
-                    write_not_found_response(stream, keep_alive).await?;
-                }
             }
 
             if !keep_alive {
@@ -596,7 +591,7 @@ async fn handle_connection_inner(
             .collect();
         drop(parsed);
 
-        // ── Read request body ──────────────────────────────────────
+        // ── Read request body 
         let body_bytes: Vec<u8> = {
             let content_length = match content_length {
                 Some(len) => len,
@@ -660,14 +655,7 @@ async fn handle_connection_inner(
             &body_bytes,
         )?;
 
-        match dispatch_request {
-            Some(request) => {
-                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive).await?;
-            }
-            None => {
-                write_not_found_response(stream, keep_alive).await?;
-            }
-        }
+        write_dynamic_dispatch_response(stream, dispatcher, dispatch_request, keep_alive).await?;
 
         if !keep_alive {
             stream.shutdown().await?;
@@ -676,7 +664,7 @@ async fn handle_connection_inner(
     }
 }
 
-// ─── httparse-based Request Parsing ───────────────────────────────────────────
+// ─── httparse-based Request Parsing ─────
 //
 // Uses the battle-tested `httparse` crate for RFC-compliant zero-copy parsing.
 // Single-pass: parses headers once and stores them for reuse by both the
@@ -769,7 +757,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
     })
 }
 
-// ─── Hot Root Path (GET /) ────────────────────────────────────────────────────
+// ─── Hot Root Path (GET /) ──────────────
 //
 // Ultra-fast path for the most common benchmark case. Falls back to httparse
 // if the request doesn't exactly match the expected prefix.
@@ -845,7 +833,7 @@ fn parse_hot_root_request(
     })
 }
 
-// ─── Routing ──────────────────────────────────────────────────────────────────
+// ─── Routing ────────────────────────────
 
 // ─── Bridge Envelope Building (Single-Pass Headers) ───────────────────────────
 //
@@ -857,7 +845,6 @@ fn parse_hot_root_request(
 enum DispatchDecision {
     BridgeRequest(Buffer),
     SpecializedResponse(Vec<u8>),
-    NotFound,
 }
 
 fn build_dispatch_decision_zero_copy(
@@ -865,25 +852,31 @@ fn build_dispatch_decision_zero_copy(
     parsed: &ParsedRequest<'_>,
     body: &[u8],
 ) -> Result<DispatchDecision> {
-    let Some(method_code) = method_code_from_bytes(parsed.method) else {
-        return Ok(DispatchDecision::NotFound);
-    };
-
-    let path_str = match std::str::from_utf8(parsed.path) {
-        Ok(s) => s,
-        Err(_) => return Ok(DispatchDecision::NotFound),
-    };
-    let url_str = match std::str::from_utf8(parsed.target) {
-        Ok(s) => s,
-        Err(_) => return Ok(DispatchDecision::NotFound),
-    };
+    let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
+    let path_cow = String::from_utf8_lossy(parsed.path);
+    let path_str = path_cow.as_ref();
+    let url_cow = String::from_utf8_lossy(parsed.target);
+    let url_str = url_cow.as_ref();
 
     let normalized_path = normalize_runtime_path(path_str);
     if contains_path_traversal(&normalized_path) {
-        return Ok(DispatchDecision::NotFound);
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &parsed.headers,
+            body,
+        )
+        .map(DispatchDecision::BridgeRequest);
     }
 
-    let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
+    let matched_route = if method_code == UNKNOWN_METHOD_CODE {
+        None
+    } else {
+        router.match_route(method_code, normalized_path.as_ref())
+    };
+
+    let Some(matched_route) = matched_route else {
         return build_not_found_dispatch_envelope(
             method_code,
             path_str,
@@ -918,40 +911,45 @@ fn build_dispatch_request_owned(
     path: &[u8],
     headers: &[(String, String)],
     body: &[u8],
-) -> Result<Option<Buffer>> {
-    let Some(method_code) = method_code_from_bytes(method) else {
-        return Ok(None);
-    };
+) -> Result<Buffer> {
+    let method_code = method_code_from_bytes(method).unwrap_or(UNKNOWN_METHOD_CODE);
 
-    let path_str = match std::str::from_utf8(path) {
-        Ok(path_str) => path_str,
-        Err(_) => return Ok(None),
-    };
-    let url_str = match std::str::from_utf8(target) {
-        Ok(url_str) => url_str,
-        Err(_) => return Ok(None),
-    };
-
-    // Security: strict path validation
-    let normalized_path = normalize_runtime_path(path_str);
-    if contains_path_traversal(&normalized_path) {
-        return Ok(None);
-    }
+    let path_cow = String::from_utf8_lossy(path);
+    let path_str = path_cow.as_ref();
+    let url_cow = String::from_utf8_lossy(target);
+    let url_str = url_cow.as_ref();
 
     let header_refs: Vec<(&str, &str)> = headers
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
 
-    let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
+    // Security: strict path validation
+    let normalized_path = normalize_runtime_path(path_str);
+    if contains_path_traversal(&normalized_path) {
         return build_not_found_dispatch_envelope(
             method_code,
             path_str,
             url_str,
             &header_refs,
             body,
-        )
-        .map(Some);
+        );
+    }
+
+    let matched_route = if method_code == UNKNOWN_METHOD_CODE {
+        None
+    } else {
+        router.match_route(method_code, normalized_path.as_ref())
+    };
+
+    let Some(matched_route) = matched_route else {
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &header_refs,
+            body,
+        );
     };
 
     build_dispatch_envelope(
@@ -962,7 +960,6 @@ fn build_dispatch_request_owned(
         &header_refs,
         body,
     )
-    .map(Some)
 }
 
 fn build_not_found_dispatch_envelope(
@@ -1408,7 +1405,7 @@ fn build_response_bytes_fast(
     output
 }
 
-// ─── Response Writing ─────────────────────────────────────────────────────────
+// ─── Response Writing ───────────────────
 
 async fn write_exact_static_response(
     stream: &mut TcpStream,
@@ -1539,17 +1536,6 @@ fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) ->
     Ok(output)
 }
 
-async fn write_not_found_response(stream: &mut TcpStream, keep_alive: bool) -> Result<()> {
-    let response = if keep_alive {
-        Bytes::from_static(NOT_FOUND_RESPONSE_KEEP_ALIVE)
-    } else {
-        Bytes::from_static(NOT_FOUND_RESPONSE_CLOSE)
-    };
-    let (write_result, _) = stream.write_all(response).await;
-    write_result?;
-    Ok(())
-}
-
 /// Build a simple error response without going through the JS bridge
 fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec<u8> {
     build_response_bytes(
@@ -1636,7 +1622,7 @@ fn build_response_bytes(
     output
 }
 
-// ─── Security Utilities ───────────────────────────────────────────────────────
+// ─── Security Utilities ─────────────────
 
 /// Check for path traversal attempts (../, ..\, etc.)
 fn contains_path_traversal(path: &str) -> bool {
@@ -1675,7 +1661,7 @@ pub(crate) fn escape_json(value: &str) -> String {
     output
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────
 
 fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
     match method {

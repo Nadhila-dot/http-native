@@ -4,6 +4,8 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const PLAIN_OBJECT_PROTOTYPE = Object.prototype;
 const EMPTY_ARRAY = Object.freeze([]);
+const HEADER_LOOKUP_CACHE_MAX = 128;
+const headerLookupNameCache = new Map();
 
 export const BRIDGE_VERSION = 1;
 export const REQUEST_FLAG_QUERY_PRESENT = 1 << 0;
@@ -27,7 +29,7 @@ export const ROUTE_KIND = Object.freeze({
 // Security: use null-prototype objects for user-facing data to prevent prototype pollution
 const EMPTY_OBJECT = Object.freeze(Object.create(null));
 
-// ─── Regex patterns for source analysis ───────────────────────────────────────
+// ─── Regex patterns for source analysis ─
 
 const PARAM_DOT_RE = /\breq\.params\.([A-Za-z_$][\w$]*)\b/g;
 const PARAM_BRACKET_RE = /\breq\.params\[(['"])([^"'\\]+)\1\]/g;
@@ -59,7 +61,7 @@ const DANGEROUS_KEYS = new Set([
   "__lookupSetter__",
 ]);
 
-// ─── Route Compilation ────────────────────────────────────────────────────────
+// ─── Route Compilation ──────────────────
 
 export function compileRouteShape(method, path) {
   const methodCode = METHOD_CODES[method];
@@ -90,7 +92,7 @@ export function compileRouteShape(method, path) {
   };
 }
 
-// ─── Request Access Analysis ──────────────────────────────────────────────────
+// ─── Request Access Analysis ────────────
 
 export function analyzeRequestAccess(source) {
   const plan = createEmptyAccessPlan();
@@ -203,6 +205,7 @@ export function releaseRequestObject(req) {
   req._params = undefined;
   req._query = undefined;
   req._headers = undefined;
+  req._headerLookup = undefined;
   req._decoded = null;
   req._routeParamNames = null;
   req._plan = null;
@@ -219,6 +222,7 @@ function createPooledRequest() {
   req._params = undefined;
   req._query = undefined;
   req._headers = undefined;
+  req._headerLookup = undefined;
   req._bodyParsed = undefined;
   req._decoded = null;
   req._routeParamNames = null;
@@ -288,26 +292,30 @@ function createPooledRequest() {
     get() {
       if (req._headers === undefined) {
         const needsHeaders = req._plan.fullHeaders || req._plan.headerKeys.size > 0;
-        req._headers = needsHeaders
-          ? materializeHeaderObject(req._decoded.rawHeaders, req._plan)
-          : EMPTY_OBJECT;
+        if (!needsHeaders) {
+          req._headers = EMPTY_OBJECT;
+        } else if (req._plan.fullHeaders) {
+          req._headers = ensureHeaderLookup(req);
+        } else {
+          req._headers = materializeSelectedHeadersFromLookup(
+            ensureHeaderLookup(req),
+            req._plan.headerKeys,
+          );
+        }
       }
       return req._headers;
     },
   });
 
   req.header = function header(name) {
-    const lookup = normalizeHeaderLookup(name);
+    const lookup = normalizeHeaderLookupCached(name);
     if (req._headers && lookup in req._headers) {
       return req._headers[lookup];
     }
-    if (req._decoded.rawHeaders.length === 0) {
-      return undefined;
-    }
-    return lookupHeaderValue(req._decoded.rawHeaders, lookup);
+    return ensureHeaderLookup(req)[lookup];
   };
 
-  // ─── Body APIs ────────────────────────────────────────────────────────
+  // ─── Body APIs ──────────────────
 
   Object.defineProperty(req, "body", {
     configurable: true,
@@ -396,13 +404,14 @@ export function createRequestFactory(
     request._params = undefined;
     request._query = undefined;
     request._headers = undefined;
+    request._headerLookup = undefined;
     request._bodyParsed = undefined;
 
     return request;
   };
 }
 
-// ─── JSON Serialization ───────────────────────────────────────────────────────
+// ─── JSON Serialization ─────────────────
 
 export function createJsonSerializer(mode = "fallback") {
   // Performance: V8's native JSON.stringify is heavily optimized and almost always
@@ -415,7 +424,7 @@ export function createJsonSerializer(mode = "fallback") {
   return serializer;
 }
 
-// ─── Binary Protocol Codec ────────────────────────────────────────────────────
+// ─── Binary Protocol Codec ──────────────
 
 export function decodeRequestEnvelope(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -476,17 +485,19 @@ export function decodeRequestEnvelope(buffer) {
   const bodyBytes = bodyLength > 0 ? readBytes(bytes, offset, bodyLength) : null;
   offset += bodyLength;
 
-  switch (methodCode) {
-    case METHOD_CODES.GET:
-    case METHOD_CODES.POST:
-    case METHOD_CODES.PUT:
-    case METHOD_CODES.DELETE:
-    case METHOD_CODES.PATCH:
-    case METHOD_CODES.OPTIONS:
-    case METHOD_CODES.HEAD:
-      break;
-    default:
-      throw new Error(`Unknown method code ${methodCode}`);
+  if (methodCode !== 0) {
+    switch (methodCode) {
+      case METHOD_CODES.GET:
+      case METHOD_CODES.POST:
+      case METHOD_CODES.PUT:
+      case METHOD_CODES.DELETE:
+      case METHOD_CODES.PATCH:
+      case METHOD_CODES.OPTIONS:
+      case METHOD_CODES.HEAD:
+        break;
+      default:
+        throw new Error(`Unknown method code ${methodCode}`);
+    }
   }
 
   return {
@@ -580,14 +591,6 @@ function materializeParamObject(entries, paramNames, plan) {
   return materializeSelectedParamPairs(entries, paramNames, plan.paramKeys);
 }
 
-function materializeHeaderObject(entries, plan) {
-  if (plan.fullHeaders) {
-    return materializePairs(entries, true);
-  }
-
-  return materializeSelectedPairs(entries, plan.headerKeys, true);
-}
-
 function materializeQueryObject(url, flags, plan) {
   if (!(flags & REQUEST_FLAG_QUERY_PRESENT)) {
     return Object.create(null);
@@ -598,23 +601,6 @@ function materializeQueryObject(url, flags, plan) {
   }
 
   return parseSelectedQuery(url, plan.queryKeys);
-}
-
-function materializePairs(entries, lowerCaseKeys = false) {
-  // Security: null-prototype object prevents prototype pollution
-  const result = Object.create(null);
-
-  for (const [rawName, rawValue] of entries) {
-    const name = textDecoder.decode(rawName);
-    const key = lowerCaseKeys ? name.toLowerCase() : name;
-    // Security: skip dangerous prototype keys
-    if (DANGEROUS_KEYS.has(key)) {
-      continue;
-    }
-    result[key] = textDecoder.decode(rawValue);
-  }
-
-  return result;
 }
 
 function materializeParamPairs(entries, paramNames) {
@@ -647,20 +633,21 @@ function materializeSelectedParamPairs(entries, paramNames, selectedKeys) {
   return result;
 }
 
-function materializeSelectedPairs(entries, selectedKeys, lowerCaseKeys = false) {
-  if (selectedKeys.size === 0) {
-    return Object.create(null);
+function materializeSelectedHeadersFromLookup(headerLookup, selectedKeys) {
+  if (selectedKeys.size === 0 || headerLookup === EMPTY_OBJECT) {
+    return EMPTY_OBJECT;
   }
 
   const result = Object.create(null);
-  for (const [rawName, rawValue] of entries) {
-    const name = textDecoder.decode(rawName);
-    const key = lowerCaseKeys ? name.toLowerCase() : name;
-    if (selectedKeys.has(key) && !DANGEROUS_KEYS.has(key)) {
-      result[key] = textDecoder.decode(rawValue);
+  for (const key of selectedKeys) {
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
+    const value = headerLookup[key];
+    if (value !== undefined) {
+      result[key] = value;
     }
   }
-
   return result;
 }
 
@@ -719,18 +706,31 @@ function pushQueryEntry(result, key, value) {
   result[key] = value;
 }
 
-function lookupHeaderValue(entries, targetName) {
-  for (const [rawName, rawValue] of entries) {
-    const name = textDecoder.decode(rawName).toLowerCase();
-    if (name === targetName) {
-      return textDecoder.decode(rawValue);
-    }
+function ensureHeaderLookup(req) {
+  if (req._headerLookup !== undefined) {
+    return req._headerLookup;
   }
 
-  return undefined;
+  const entries = req._decoded.rawHeaders;
+  if (entries.length === 0) {
+    req._headerLookup = EMPTY_OBJECT;
+    return req._headerLookup;
+  }
+
+  const result = Object.create(null);
+  for (const [rawName, rawValue] of entries) {
+    const name = textDecoder.decode(rawName).toLowerCase();
+    if (DANGEROUS_KEYS.has(name)) {
+      continue;
+    }
+    result[name] = textDecoder.decode(rawValue);
+  }
+
+  req._headerLookup = result;
+  return result;
 }
 
-// ─── Access Plan ──────────────────────────────────────────────────────────────
+// ─── Access Plan ────────────────────────
 
 function createEmptyAccessPlan() {
   return {
@@ -770,6 +770,23 @@ function normalizeHeaderLookup(value) {
   return String(value).toLowerCase();
 }
 
+function normalizeHeaderLookupCached(value) {
+  if (typeof value !== "string") {
+    return normalizeHeaderLookup(value);
+  }
+
+  const cached = headerLookupNameCache.get(value);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const normalized = value.toLowerCase();
+  if (headerLookupNameCache.size < HEADER_LOOKUP_CACHE_MAX) {
+    headerLookupNameCache.set(value, normalized);
+  }
+  return normalized;
+}
+
 function detectJsonFastPath(source) {
   if (!source.includes("res.json(")) {
     return "fallback";
@@ -800,7 +817,7 @@ function encodeUtf8(value) {
   return textEncoder.encode(String(value));
 }
 
-// ─── Binary Protocol Helpers ──────────────────────────────────────────────────
+// ─── Binary Protocol Helpers ────────────
 
 function readBytes(bytes, offset, length) {
   if (offset + length > bytes.byteLength) {

@@ -12,7 +12,7 @@ const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
 const MAX_STACK_SEGMENTS: usize = 16;
 
-// ─── Public Types ─────────────────────────────────────────────────────────────
+// ─── Public Types ───────────────────────
 
 #[derive(Clone)]
 pub struct Router {
@@ -43,7 +43,7 @@ pub struct MatchedRoute<'a, 'b> {
     pub fast_path: Option<&'a DynamicFastPathSpec>,
 }
 
-// ─── Internal Types ───────────────────────────────────────────────────────────
+// ─── Internal Types ─────────────────────
 
 #[derive(Clone)]
 struct DynamicRouteSpec {
@@ -68,7 +68,7 @@ enum MethodKey {
     Put,
 }
 
-// ─── Radix Tree ───────────────────────────────────────────────────────────────
+// ─── Radix Tree ─────────────────────────
 //
 // Each node represents either a static prefix or a parameter capture.
 // Matching is O(M) where M is the number of path segments, not O(N) routes.
@@ -180,7 +180,7 @@ impl RadixNode {
     }
 }
 
-// ─── Router Implementation ────────────────────────────────────────────────────
+// ─── Router Implementation ──────────────
 
 impl Router {
     pub fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
@@ -326,7 +326,7 @@ impl Router {
     }
 }
 
-// ─── MethodKey ────────────────────────────────────────────────────────────────
+// ─── MethodKey ──────────────────────────
 
 impl MethodKey {
     fn from_method_str(method: &str) -> Option<Self> {
@@ -369,7 +369,7 @@ impl MethodKey {
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────
 
 fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput]) -> DynamicRouteSpec {
     let param_names = route

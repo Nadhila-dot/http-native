@@ -2,15 +2,6 @@
   <img src="https://cf-data.pkg.lat/httpnative-banner.png" alt="Http-native banner" width="720" />
 </p>
 
-| http-native | static | 95,366.30 | 2.09 | 61.65 | 14.55 |
-| http-native | dynamic | 46,880.14 | 4.26 | 23.99 | 7.19 |
-| http-native | opt | 68,364.14 | 2.92 | 19.77 | 11.86 |
-| bun | static | 50,728.86 | 3.94 | 10.72 | 7.93 |
-| bun | dynamic | 46,020.19 | 4.34 | 10.80 | 7.24 |
-| bun | opt | 50,000.29 | 4.00 | 12.41 | 8.87 |
-| fiber | static | 91,129.18 | 2.19 | 25.62 | 13.22 |
-| fiber | dynamic | 89,940.82 | 2.22 | 22.58 | 13.12 |
-| fiber | opt | 88,203.77 | 2.26 | 23.64 | 14.63 |
 
 Http-native
 

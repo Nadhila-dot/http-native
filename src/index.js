@@ -35,7 +35,7 @@ const ERROR_REQUEST_PLAN = Object.freeze({
   jsonFastPath: "fallback",
 });
 
-// ─── Path Normalization ───────────────────────────────────────────────────────
+// ─── Path Normalization ─────────────────
 
 function normalizePathPrefix(path) {
   if (path === "/") {
@@ -240,7 +240,7 @@ function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
   };
 }
 
-// ─── Compiled Middleware Runner ────────────────────────────────────────────────
+// ─── Compiled Middleware Runner ──────────
 //
 // Generates an optimized runner that avoids function.length checks at runtime
 // by pre-classifying middlewares during compilation.
@@ -299,7 +299,7 @@ function createMiddlewareRunner(middlewares) {
   };
 }
 
-// ─── Error Handling (Security-Hardened) ───────────────────────────────────────
+// ─── Error Handling (Security-Hardened) ─
 
 function normalizeErrorStatus(error, fallbackStatus = 500) {
   const status = Number(error?.status ?? error?.statusCode ?? fallbackStatus);
@@ -320,14 +320,20 @@ function createHttpError(status, message, code) {
 function buildDefaultErrorSnapshot(error, fallbackStatus = 500) {
   // Security: NEVER leak internal error details to the client
   const status = normalizeErrorStatus(error, fallbackStatus);
+  if (status === 404) {
+    return {
+      status,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+      },
+      body: Buffer.from("Not Found", "utf8"),
+    };
+  }
+
   const isProduction = process.env.NODE_ENV === "production";
   let body;
 
-  if (status === 404) {
-    body = {
-      error: error?.message || "Route not found",
-    };
-  } else if (status >= 500) {
+  if (status >= 500) {
     body = isProduction
       ? { error: "Internal Server Error" }
       : {
@@ -364,7 +370,7 @@ function isPromiseLike(value) {
   );
 }
 
-// ─── Dispatcher ───────────────────────────────────────────────────────────────
+// ─── Dispatcher ─────────────────────────
 
 function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
@@ -461,7 +467,7 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
   };
 }
 
-// ─── Route Registration & Compilation ─────────────────────────────────────────
+// ─── Route Registration & Compilation ───
 
 function normalizeRouteRegistration(method, path, handler) {
   if (typeof handler !== "function") {
@@ -662,7 +668,7 @@ function normalizeListenOptions(options = {}) {
   };
 }
 
-// ─── Application Factory ─────────────────────────────────────────────────────
+// ─── Application Factory ───────────────
 
 export function createApp() {
   const native = loadNativeModule();

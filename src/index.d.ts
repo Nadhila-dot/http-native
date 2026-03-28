@@ -91,7 +91,7 @@ export type ErrorHandler = (
   res: Response,
 ) => void | Promise<void>;
 
-// ─── Listen Options ───────────────────────────────────────────────────────────
+// ─── Listen Options ─────────────────────
 
 export interface HttpServerConfig {
   defaultHost?: string;
@@ -116,7 +116,7 @@ export interface ListenOptions {
   opt?: Record<string, unknown>;
 }
 
-// ─── Server Handle ────────────────────────────────────────────────────────────
+// ─── Server Handle ──────────────────────
 
 export interface ServerHandle {
   /** Bound hostname */
@@ -157,7 +157,7 @@ export interface RouteOptimizationInfo {
   jsonFastPath?: string;
 }
 
-// ─── Application ──────────────────────────────────────────────────────────────
+// ─── Application ────────────────────────
 
 export interface Application {
   /** Register path-scoped or global middleware */
@@ -198,7 +198,7 @@ export interface Application {
 /** Create a new http-native application */
 export function createApp(): Application;
 
-// ─── CORS Types ───────────────────────────────────────────────────────────────
+// ─── CORS Types ─────────────────────────
 
 export interface CorsOptions {
   /** Allowed origin(s). Default: "*" */
@@ -226,7 +226,7 @@ export interface CorsOptions {
 /** Create a CORS middleware */
 export function cors(options?: CorsOptions): Middleware;
 
-// ─── Validation Types ─────────────────────────────────────────────────────────
+// ─── Validation Types ───────────────────
 
 export interface ValidationSchema<T = unknown> {
   parse(data: unknown): T;

@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export function loadNativeModule() {
-  const configuredPath = process.env.HTTP_NATIVE_NODE_PATH;
+  const configuredPath = process.env.HTTP_NATIVE_NATIVE_PATH ?? process.env.HTTP_NATIVE_NODE_PATH;
   const nativeModulePath = configuredPath
     ? resolve(rootDir, configuredPath)
     : resolve(rootDir, "http-native.node");

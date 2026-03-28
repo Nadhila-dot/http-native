@@ -19,6 +19,8 @@ import { createRuntimeOptimizer } from "../opt/runtime.js";
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
+const NOOP_NEXT = () => undefined;
+const ROUTE_CACHE_PROMOTE_HITS = 16;
 const ERROR_REQUEST_PLAN = Object.freeze({
   method: true,
   path: true,
@@ -33,7 +35,7 @@ const ERROR_REQUEST_PLAN = Object.freeze({
   jsonFastPath: "fallback",
 });
 
-// ─── Path Normalization ───────────────────────────────────────────────────────
+// ─── Path Normalization ─────────────────
 
 function normalizePathPrefix(path) {
   if (path === "/") {
@@ -83,10 +85,12 @@ function normalizeContentType(type) {
 
 
 const RESPONSE_POOL_MAX = 512;
-const responsePool = [];
+const responseStatePool = [];
+const responseObjectPool = [];
+const DEFAULT_JSON_SERIALIZER = createJsonSerializer("fallback");
 
 function acquireResponseState() {
-  const pooled = responsePool.pop();
+  const pooled = responseStatePool.pop();
   if (pooled) {
     pooled.status = 200;
     // Reset headers — use null-prototype object for security
@@ -112,99 +116,108 @@ function acquireResponseState() {
 }
 
 function releaseResponseState(state) {
-  if (responsePool.length < RESPONSE_POOL_MAX) {
-    responsePool.push(state);
+  if (responseStatePool.length < RESPONSE_POOL_MAX) {
+    responseStatePool.push(state);
   }
 }
 
-function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback")) {
-  const state = acquireResponseState();
+const RESPONSE_PROTO = {
+  get finished() {
+    return this._state.finished;
+  },
 
-  const response = {
-    locals: state.locals,
+  status(code) {
+    this._state.status = Number(code);
+    return this;
+  },
 
-    get finished() {
-      return state.finished;
-    },
+  set(name, value) {
+    // Security: validate header name/value for CRLF injection
+    const headerName = String(name).toLowerCase();
+    const headerValue = String(value);
+    if (
+      headerName.includes("\r") ||
+      headerName.includes("\n") ||
+      headerValue.includes("\r") ||
+      headerValue.includes("\n")
+    ) {
+      return this; // Silently reject — security
+    }
+    this._state.headers[headerName] = headerValue;
+    return this;
+  },
 
-    status(code) {
-      state.status = Number(code);
-      return response;
-    },
+  header(name, value) {
+    return this.set(name, value);
+  },
 
-    set(name, value) {
-      // Security: validate header name/value for CRLF injection
-      const headerName = String(name).toLowerCase();
-      const headerValue = String(value);
-      if (headerName.includes("\r") || headerName.includes("\n") ||
-          headerValue.includes("\r") || headerValue.includes("\n")) {
-        return response; // Silently reject — security
-      }
-      state.headers[headerName] = headerValue;
-      return response;
-    },
+  get(name) {
+    return this._state.headers[String(name).toLowerCase()];
+  },
 
-    header(name, value) {
-      return response.set(name, value);
-    },
+  type(value) {
+    return this.set("content-type", normalizeContentType(String(value)));
+  },
 
-    get(name) {
-      return state.headers[String(name).toLowerCase()];
-    },
+  json(data) {
+    const state = this._state;
+    if (state.finished) {
+      return this;
+    }
 
-    type(value) {
-      return response.set("content-type", normalizeContentType(String(value)));
-    },
+    if (!state.headers["content-type"]) {
+      state.headers["content-type"] = "application/json; charset=utf-8";
+    }
 
-    json(data) {
-      if (state.finished) {
-        return response;
-      }
+    state.body = this._jsonSerializer(data);
+    state.finished = true;
+    return this;
+  },
 
+  send(data) {
+    const state = this._state;
+    if (state.finished) {
+      return this;
+    }
+
+    if (Buffer.isBuffer(data) || data instanceof Uint8Array) {
       if (!state.headers["content-type"]) {
-        state.headers["content-type"] = "application/json; charset=utf-8";
+        state.headers["content-type"] = "application/octet-stream";
       }
-
-      state.body = jsonSerializer(data);
-      state.finished = true;
-      return response;
-    },
-
-    send(data) {
-      if (state.finished) {
-        return response;
-      }
-
-      if (Buffer.isBuffer(data) || data instanceof Uint8Array) {
-        if (!state.headers["content-type"]) {
-          state.headers["content-type"] = "application/octet-stream";
-        }
-        state.body = Buffer.isBuffer(data)
-          ? data
-          : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-      } else if (typeof data === "string") {
-        if (!state.headers["content-type"]) {
-          state.headers["content-type"] = "text/plain; charset=utf-8";
-        }
-        state.body = Buffer.from(data, "utf8");
-      } else if (data === undefined || data === null) {
-        state.body = EMPTY_BUFFER;
-      } else {
-        return response.json(data);
-      }
-
-      state.finished = true;
-      return response;
-    },
-
-    sendStatus(code) {
-      response.status(code);
+      state.body = Buffer.isBuffer(data)
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    } else if (typeof data === "string") {
       if (!state.headers["content-type"]) {
         state.headers["content-type"] = "text/plain; charset=utf-8";
       }
-      return response.send(String(code));
-    },
-  };
+      state.body = Buffer.from(data, "utf8");
+    } else if (data === undefined || data === null) {
+      state.body = EMPTY_BUFFER;
+    } else {
+      return this.json(data);
+    }
+
+    state.finished = true;
+    return this;
+  },
+
+  sendStatus(code) {
+    this.status(code);
+    const state = this._state;
+    if (!state.headers["content-type"]) {
+      state.headers["content-type"] = "text/plain; charset=utf-8";
+    }
+    return this.send(String(code));
+  },
+};
+
+function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
+  const state = acquireResponseState();
+  const response = responseObjectPool.pop() ?? Object.create(RESPONSE_PROTO);
+  response._state = state;
+  response._jsonSerializer = jsonSerializer;
+  response.locals = state.locals;
 
   return {
     response,
@@ -216,12 +229,18 @@ function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback"
       };
     },
     release() {
+      response.locals = null;
+      response._jsonSerializer = DEFAULT_JSON_SERIALIZER;
+      response._state = null;
+      if (responseObjectPool.length < RESPONSE_POOL_MAX) {
+        responseObjectPool.push(response);
+      }
       releaseResponseState(state);
     },
   };
 }
 
-// ─── Compiled Middleware Runner ────────────────────────────────────────────────
+// ─── Compiled Middleware Runner ──────────
 //
 // Generates an optimized runner that avoids function.length checks at runtime
 // by pre-classifying middlewares during compilation.
@@ -229,19 +248,19 @@ function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback"
 function createMiddlewareRunner(middlewares) {
   if (middlewares.length === 0) {
     // Fast path: no middlewares — return a no-op
-    return async function noopMiddleware(_req, _res) {};
+    return function noopMiddleware(_req, _res) {};
   }
 
   if (middlewares.length === 1) {
     // Fast path: single middleware — avoid dispatch overhead
     const mw = middlewares[0];
     if (mw.handler.length >= 3) {
-      return async function runSingleMiddleware(req, res) {
-        await mw.handler(req, res, () => Promise.resolve());
+      return function runSingleMiddleware(req, res) {
+        return mw.handler(req, res, NOOP_NEXT);
       };
     }
-    return async function runSingleMiddleware(req, res) {
-      await mw.handler(req, res);
+    return function runSingleMiddleware(req, res) {
+      return mw.handler(req, res);
     };
   }
 
@@ -280,7 +299,7 @@ function createMiddlewareRunner(middlewares) {
   };
 }
 
-// ─── Error Handling (Security-Hardened) ───────────────────────────────────────
+// ─── Error Handling (Security-Hardened) ─
 
 function normalizeErrorStatus(error, fallbackStatus = 500) {
   const status = Number(error?.status ?? error?.statusCode ?? fallbackStatus);
@@ -301,14 +320,20 @@ function createHttpError(status, message, code) {
 function buildDefaultErrorSnapshot(error, fallbackStatus = 500) {
   // Security: NEVER leak internal error details to the client
   const status = normalizeErrorStatus(error, fallbackStatus);
+  if (status === 404) {
+    return {
+      status,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+      },
+      body: Buffer.from("Not Found", "utf8"),
+    };
+  }
+
   const isProduction = process.env.NODE_ENV === "production";
   let body;
 
-  if (status === 404) {
-    body = {
-      error: error?.message || "Route not found",
-    };
-  } else if (status >= 500) {
+  if (status >= 500) {
     body = isProduction
       ? { error: "Internal Server Error" }
       : {
@@ -337,7 +362,15 @@ function serializeErrorResponse(error, fallbackStatus = 500) {
   return encodeResponseEnvelope(buildDefaultErrorSnapshot(error, fallbackStatus));
 }
 
-// ─── Dispatcher ───────────────────────────────────────────────────────────────
+function isPromiseLike(value) {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof value.then === "function"
+  );
+}
+
+// ─── Dispatcher ─────────────────────────
 
 function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
@@ -347,7 +380,10 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     try {
       if (!res.finished) {
         for (const errorHandler of errorHandlers) {
-          await errorHandler(error, req, res);
+          const result = errorHandler(error, req, res);
+          if (!res.finished && isPromiseLike(result)) {
+            await result;
+          }
           if (res.finished) {
             break;
           }
@@ -396,13 +432,26 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
       return serializeErrorResponse(new Error(`Unknown handler id ${decoded.handlerId}`));
     }
 
+    const cachedResponse = route.runtimeResponseCache?.encoded;
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+
     const req = route.requestFactory(decoded);
     const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
 
     try {
-      await route.runMiddlewares(req, res);
+      const middlewareResult = route.runMiddlewares(req, res);
+      if (!res.finished && isPromiseLike(middlewareResult)) {
+        await middlewareResult;
+      }
       if (!res.finished) {
-        await route.compiledHandler(req, res);
+        const handlerResult = route.compiledHandler(req, res);
+        // Async handlers with no await often finish synchronously and only return
+        // an already-resolved Promise. Skip awaiting when response is already done.
+        if (!res.finished && isPromiseLike(handlerResult)) {
+          await handlerResult;
+        }
       }
     } catch (error) {
       return finalizeError(error, req, res, snapshot, release, 500);
@@ -411,13 +460,14 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     const responseSnapshot = snapshot();
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
     const encoded = encodeResponseEnvelope(responseSnapshot);
+    maybePromoteRouteResponseCache(route, responseSnapshot, encoded);
     releaseRequestObject(req);
     release();
     return encoded;
   };
 }
 
-// ─── Route Registration & Compilation ─────────────────────────────────────────
+// ─── Route Registration & Compilation ───
 
 function normalizeRouteRegistration(method, path, handler) {
   if (typeof handler !== "function") {
@@ -441,13 +491,124 @@ function compileMiddlewareRegistration(middleware) {
   };
 }
 
-function compileRouteDispatch(route, middlewares) {
+function createRouteResponseCache(route, applicableMiddlewares, requestPlan, optConfig) {
+  if (optConfig?.cache !== true) {
+    return null;
+  }
+
+  if (route.method !== "GET" || route.path.includes(":")) {
+    return null;
+  }
+
+  if (applicableMiddlewares.length > 0) {
+    return null;
+  }
+
+  if (!hasNoRequestAccess(requestPlan)) {
+    return null;
+  }
+
+  const source = route.handlerSource ?? "";
+  if (source.includes("await")) {
+    return null;
+  }
+
+  if (/Date\.now|new Date|Math\.random|crypto\./.test(source)) {
+    return null;
+  }
+
+  return {
+    encoded: null,
+    lastKey: "",
+    stableHits: 0,
+  };
+}
+
+function hasNoRequestAccess(plan) {
+  return (
+    plan.method !== true &&
+    plan.path !== true &&
+    plan.url !== true &&
+    plan.fullParams !== true &&
+    plan.fullQuery !== true &&
+    plan.fullHeaders !== true &&
+    plan.paramKeys.size === 0 &&
+    plan.queryKeys.size === 0 &&
+    plan.headerKeys.size === 0
+  );
+}
+
+function maybePromoteRouteResponseCache(route, snapshot, encoded) {
+  const cache = route.runtimeResponseCache;
+  if (!cache || cache.encoded) {
+    return;
+  }
+
+  const key = buildSnapshotCacheKey(snapshot);
+  if (key === cache.lastKey) {
+    cache.stableHits += 1;
+  } else {
+    cache.lastKey = key;
+    cache.stableHits = 1;
+  }
+
+  if (cache.stableHits >= ROUTE_CACHE_PROMOTE_HITS) {
+    cache.encoded = encoded;
+  }
+}
+
+function buildSnapshotCacheKey(snapshot) {
+  let hash = 0x811c9dc5;
+  hash = fnv1aString(hash, String(snapshot.status ?? 200));
+
+  const headers = snapshot.headers ?? Object.create(null);
+  const headerNames = Object.keys(headers);
+  for (const name of headerNames) {
+    hash = fnv1aString(hash, name);
+    hash = fnv1aString(hash, String(headers[name]));
+  }
+
+  const body = Buffer.isBuffer(snapshot.body)
+    ? snapshot.body
+    : snapshot.body instanceof Uint8Array
+      ? snapshot.body
+      : EMPTY_BUFFER;
+  hash = fnv1aBytes(hash, body);
+
+  return `${hash}:${body.length}:${headerNames.length}`;
+}
+
+function fnv1aString(seed, value) {
+  let hash = seed >>> 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function fnv1aBytes(seed, bytes) {
+  let hash = seed >>> 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash ^= bytes[index];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function compileRouteDispatch(
+  route,
+  middlewares,
+  errorHandlerPlans = [],
+  optConfig = {},
+) {
   const applicableMiddlewares = middlewares.filter((middleware) =>
     pathPrefixMatches(middleware.pathPrefix, route.path),
   );
   const requestPlan = mergeRequestAccessPlans([
     route.accessPlan,
     ...applicableMiddlewares.map((middleware) => middleware.accessPlan),
+    ...errorHandlerPlans,
   ]);
 
   const requestFactory = createRequestFactory(
@@ -472,6 +633,7 @@ function compileRouteDispatch(route, middlewares) {
     dispatchKind: requestPlan.dispatchKind,
     jsonFastPath,
     jsonSerializer: createJsonSerializer(jsonFastPath),
+    runtimeResponseCache: createRouteResponseCache(route, applicableMiddlewares, requestPlan, optConfig),
   };
 }
 
@@ -506,7 +668,7 @@ function normalizeListenOptions(options = {}) {
   };
 }
 
-// ─── Application Factory ─────────────────────────────────────────────────────
+// ─── Application Factory ───────────────
 
 export function createApp() {
   const native = loadNativeModule();
@@ -557,6 +719,9 @@ export function createApp() {
     async listen(options = {}) {
       const normalizedOptions = normalizeListenOptions(options);
       const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
+      const errorHandlerPlans = this._errorHandlers.map((handler) =>
+        analyzeRequestAccess(Function.prototype.toString.call(handler)),
+      );
 
       const routes = this._routes.map((route) => {
         const handlerSource = Function.prototype.toString.call(route.handler);
@@ -570,7 +735,12 @@ export function createApp() {
         };
       });
       const compiledRoutes = routes.map((route) =>
-        compileRouteDispatch(route, compiledMiddlewares),
+        compileRouteDispatch(
+          route,
+          compiledMiddlewares,
+          errorHandlerPlans,
+          normalizedOptions.opt,
+        ),
       );
 
       const manifest = {
@@ -590,6 +760,11 @@ export function createApp() {
           segmentCount: route.segmentCount,
           headerKeys: [...route.requestPlan.headerKeys],
           fullHeaders: route.requestPlan.fullHeaders,
+          needsPath: route.requestPlan.path,
+          needsUrl: route.requestPlan.url,
+          needsQuery:
+            route.requestPlan.fullQuery ||
+            route.requestPlan.queryKeys.size > 0,
         })),
       };
 

@@ -5,13 +5,15 @@ import { once } from "node:events";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
-const DEFAULT_ENGINES = ["http-native", "bun", "fiber"];
+const DEFAULT_ENGINES = ["http-native", "bun"];
 const DEFAULT_SCENARIOS = ["static", "dynamic", "opt"];
 const DEFAULT_CONNECTIONS = 200;
 const DEFAULT_DURATION = "10s";
 const DEFAULT_TIMEOUT = "2s";
 const DEFAULT_OUTPUT_DIR = "bench/results";
+const DEFAULT_HTTP_NATIVE_RUNTIME = "bun";
 const DEFAULT_BOMBARDIER_BIN = resolveBombardierBin();
+const SUPPORTED_HTTP_NATIVE_RUNTIMES = new Set(["bun", "node"]);
 
 const SERVER_PORTS = Object.freeze({
   bun: { static: 3000, dynamic: 3010, opt: 3020 },
@@ -59,6 +61,7 @@ async function main() {
       connections: options.connections,
       duration: options.duration,
       timeout: options.timeout,
+      httpNativeRuntime: options.httpNativeRuntime,
     },
     results,
   };
@@ -130,6 +133,15 @@ function parseArgs(argv) {
   const duration = values.get("duration") ?? DEFAULT_DURATION;
   const timeout = values.get("timeout") ?? DEFAULT_TIMEOUT;
   const outputDir = values.get("output-dir") ?? DEFAULT_OUTPUT_DIR;
+  const httpNativeRuntime = (values.get("http-native-runtime") ?? DEFAULT_HTTP_NATIVE_RUNTIME).trim();
+
+  if (!SUPPORTED_HTTP_NATIVE_RUNTIMES.has(httpNativeRuntime)) {
+    throw new Error(
+      `Unsupported --http-native-runtime \"${httpNativeRuntime}\". Supported runtimes: ${[
+        ...SUPPORTED_HTTP_NATIVE_RUNTIMES,
+      ].join(", ")}`,
+    );
+  }
 
   return {
     engines,
@@ -138,6 +150,7 @@ function parseArgs(argv) {
     duration,
     timeout,
     outputDir,
+    httpNativeRuntime,
   };
 }
 
@@ -145,11 +158,14 @@ function printUsage() {
   console.log("Usage: bun bench/ci.js [options]");
   console.log("");
   console.log("Options:");
-  console.log(`  --engines=http-native,bun,fiber   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
+  console.log(`  --engines=http-native,bun   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
   console.log(`  --scenarios=static,dynamic,opt   Comma-separated list. Default: ${DEFAULT_SCENARIOS.join(",")}`);
   console.log(`  --connections=${DEFAULT_CONNECTIONS}   Bombardier concurrency`);
   console.log(`  --duration=${DEFAULT_DURATION}   Bombardier duration`);
   console.log(`  --timeout=${DEFAULT_TIMEOUT}   Bombardier timeout`);
+  console.log(
+    `  --http-native-runtime=${DEFAULT_HTTP_NATIVE_RUNTIME}   Runtime for http-native/old: bun | node`,
+  );
   console.log(`  --output-dir=${DEFAULT_OUTPUT_DIR}   Where to write results.json and summary.md`);
 }
 
@@ -212,7 +228,7 @@ function portFor(engine, scenario) {
 async function runBenchmarkCase(testCase, options) {
   console.log(`[http-native][bench] starting ${testCase.engine}/${testCase.scenario} on :${testCase.port}`);
 
-  const server = spawnServer(testCase);
+  const server = spawnServer(testCase, options);
   const serverLogs = [];
   let readyResolve;
   const ready = new Promise((resolve) => {
@@ -308,9 +324,10 @@ async function runBenchmarkCase(testCase, options) {
   }
 }
 
-function spawnServer(testCase) {
+function spawnServer(testCase, options) {
   if (testCase.engine === "bun" || testCase.engine === "http-native" || testCase.engine === "old") {
-    return spawn("bun", ["bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
+    const runtime = testCase.engine === "bun" ? "bun" : options.httpNativeRuntime;
+    return spawn(runtime, ["bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
       cwd: process.cwd(),
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],

@@ -4,6 +4,8 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const PLAIN_OBJECT_PROTOTYPE = Object.prototype;
 const EMPTY_ARRAY = Object.freeze([]);
+const HEADER_LOOKUP_CACHE_MAX = 128;
+const headerLookupNameCache = new Map();
 
 export const BRIDGE_VERSION = 1;
 export const REQUEST_FLAG_QUERY_PRESENT = 1 << 0;
@@ -27,7 +29,7 @@ export const ROUTE_KIND = Object.freeze({
 // Security: use null-prototype objects for user-facing data to prevent prototype pollution
 const EMPTY_OBJECT = Object.freeze(Object.create(null));
 
-// ─── Regex patterns for source analysis ───────────────────────────────────────
+// ─── Regex patterns for source analysis ─
 
 const PARAM_DOT_RE = /\breq\.params\.([A-Za-z_$][\w$]*)\b/g;
 const PARAM_BRACKET_RE = /\breq\.params\[(['"])([^"'\\]+)\1\]/g;
@@ -59,7 +61,7 @@ const DANGEROUS_KEYS = new Set([
   "__lookupSetter__",
 ]);
 
-// ─── Route Compilation ────────────────────────────────────────────────────────
+// ─── Route Compilation ──────────────────
 
 export function compileRouteShape(method, path) {
   const methodCode = METHOD_CODES[method];
@@ -90,7 +92,7 @@ export function compileRouteShape(method, path) {
   };
 }
 
-// ─── Request Access Analysis ──────────────────────────────────────────────────
+// ─── Request Access Analysis ────────────
 
 export function analyzeRequestAccess(source) {
   const plan = createEmptyAccessPlan();
@@ -203,6 +205,7 @@ export function releaseRequestObject(req) {
   req._params = undefined;
   req._query = undefined;
   req._headers = undefined;
+  req._headerLookup = undefined;
   req._decoded = null;
   req._routeParamNames = null;
   req._plan = null;
@@ -219,6 +222,7 @@ function createPooledRequest() {
   req._params = undefined;
   req._query = undefined;
   req._headers = undefined;
+  req._headerLookup = undefined;
   req._bodyParsed = undefined;
   req._decoded = null;
   req._routeParamNames = null;
@@ -288,26 +292,30 @@ function createPooledRequest() {
     get() {
       if (req._headers === undefined) {
         const needsHeaders = req._plan.fullHeaders || req._plan.headerKeys.size > 0;
-        req._headers = needsHeaders
-          ? materializeHeaderObject(req._decoded.rawHeaders, req._plan)
-          : EMPTY_OBJECT;
+        if (!needsHeaders) {
+          req._headers = EMPTY_OBJECT;
+        } else if (req._plan.fullHeaders) {
+          req._headers = ensureHeaderLookup(req);
+        } else {
+          req._headers = materializeSelectedHeadersFromLookup(
+            ensureHeaderLookup(req),
+            req._plan.headerKeys,
+          );
+        }
       }
       return req._headers;
     },
   });
 
   req.header = function header(name) {
-    const lookup = normalizeHeaderLookup(name);
+    const lookup = normalizeHeaderLookupCached(name);
     if (req._headers && lookup in req._headers) {
       return req._headers[lookup];
     }
-    if (req._decoded.rawHeaders.length === 0) {
-      return undefined;
-    }
-    return lookupHeaderValue(req._decoded.rawHeaders, lookup);
+    return ensureHeaderLookup(req)[lookup];
   };
 
-  // ─── Body APIs ────────────────────────────────────────────────────────
+  // ─── Body APIs ──────────────────
 
   Object.defineProperty(req, "body", {
     configurable: true,
@@ -396,13 +404,14 @@ export function createRequestFactory(
     request._params = undefined;
     request._query = undefined;
     request._headers = undefined;
+    request._headerLookup = undefined;
     request._bodyParsed = undefined;
 
     return request;
   };
 }
 
-// ─── JSON Serialization ───────────────────────────────────────────────────────
+// ─── JSON Serialization ─────────────────
 
 export function createJsonSerializer(mode = "fallback") {
   // Performance: V8's native JSON.stringify is heavily optimized and almost always
@@ -415,35 +424,34 @@ export function createJsonSerializer(mode = "fallback") {
   return serializer;
 }
 
-// ─── Binary Protocol Codec ────────────────────────────────────────────────────
+// ─── Binary Protocol Codec ──────────────
 
 export function decodeRequestEnvelope(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
 
-  const version = readU8(view, offset);
+  const version = readU8(bytes, offset);
   offset += 1;
   if (version !== BRIDGE_VERSION) {
     throw new Error(`Unsupported request envelope version ${version}`);
   }
 
-  const methodCode = readU8(view, offset);
+  const methodCode = readU8(bytes, offset);
   offset += 1;
-  const flags = readU16(view, offset);
+  const flags = readU16(bytes, offset);
   offset += 2;
-  const handlerId = readU32(view, offset);
+  const handlerId = readU32(bytes, offset);
   offset += 4;
-  const urlLength = readU32(view, offset);
+  const urlLength = readU32(bytes, offset);
   offset += 4;
-  const pathLength = readU16(view, offset);
+  const pathLength = readU16(bytes, offset);
   offset += 2;
-  const paramCount = readU16(view, offset);
+  const paramCount = readU16(bytes, offset);
   offset += 2;
-  const headerCount = readU16(view, offset);
+  const headerCount = readU16(bytes, offset);
   offset += 2;
 
-  const bodyLength = readU32(view, offset);
+  const bodyLength = readU32(bytes, offset);
   offset += 4;
 
   const urlBytes = readBytes(bytes, offset, urlLength);
@@ -451,20 +459,20 @@ export function decodeRequestEnvelope(buffer) {
   const pathBytes = readBytes(bytes, offset, pathLength);
   offset += pathLength;
 
-  const paramValues = new Array(paramCount);
+  const paramValues = paramCount === 0 ? EMPTY_ARRAY : new Array(paramCount);
   for (let index = 0; index < paramCount; index += 1) {
-    const valueLength = readU16(view, offset);
+    const valueLength = readU16(bytes, offset);
     offset += 2;
     const valueBytes = readBytes(bytes, offset, valueLength);
     offset += valueLength;
     paramValues[index] = valueBytes;
   }
 
-  const rawHeaders = new Array(headerCount);
+  const rawHeaders = headerCount === 0 ? EMPTY_ARRAY : new Array(headerCount);
   for (let index = 0; index < headerCount; index += 1) {
-    const nameLength = readU8(view, offset);
+    const nameLength = readU8(bytes, offset);
     offset += 1;
-    const valueLength = readU16(view, offset);
+    const valueLength = readU16(bytes, offset);
     offset += 2;
     const nameBytes = readBytes(bytes, offset, nameLength);
     offset += nameLength;
@@ -477,17 +485,19 @@ export function decodeRequestEnvelope(buffer) {
   const bodyBytes = bodyLength > 0 ? readBytes(bytes, offset, bodyLength) : null;
   offset += bodyLength;
 
-  switch (methodCode) {
-    case METHOD_CODES.GET:
-    case METHOD_CODES.POST:
-    case METHOD_CODES.PUT:
-    case METHOD_CODES.DELETE:
-    case METHOD_CODES.PATCH:
-    case METHOD_CODES.OPTIONS:
-    case METHOD_CODES.HEAD:
-      break;
-    default:
-      throw new Error(`Unknown method code ${methodCode}`);
+  if (methodCode !== 0) {
+    switch (methodCode) {
+      case METHOD_CODES.GET:
+      case METHOD_CODES.POST:
+      case METHOD_CODES.PUT:
+      case METHOD_CODES.DELETE:
+      case METHOD_CODES.PATCH:
+      case METHOD_CODES.OPTIONS:
+      case METHOD_CODES.HEAD:
+        break;
+      default:
+        throw new Error(`Unknown method code ${methodCode}`);
+    }
   }
 
   return {
@@ -502,43 +512,62 @@ export function decodeRequestEnvelope(buffer) {
   };
 }
 
+// Header name encoding cache — avoids re-encoding common names like "content-type"
+const headerNameCache = new Map();
+
+function getCachedHeaderNameBytes(name) {
+  let bytes = headerNameCache.get(name);
+  if (bytes === undefined) {
+    bytes = textEncoder.encode(name);
+    if (headerNameCache.size < 64) {
+      headerNameCache.set(name, bytes);
+    }
+  }
+  return bytes;
+}
+
 export function encodeResponseEnvelope(snapshot) {
-  const headers = Object.entries(snapshot.headers ?? {}).map(([name, value]) => [
-    encodeUtf8(name),
-    encodeUtf8(String(value)),
-  ]);
+  const rawHeaders = snapshot.headers;
   const body = Buffer.isBuffer(snapshot.body)
     ? snapshot.body
     : snapshot.body instanceof Uint8Array
       ? Buffer.from(snapshot.body)
       : Buffer.alloc(0);
 
-  let totalLength = 2 + 2 + 4 + body.length;
-  for (const [nameBytes, valueBytes] of headers) {
+  // Encode headers inline — avoids Object.entries().map() intermediate arrays
+  const headerKeys = rawHeaders ? Object.keys(rawHeaders) : EMPTY_ARRAY;
+  const headerCount = headerKeys.length;
+  const encodedHeaders = new Array(headerCount);
+  let totalLength = 8 + body.length; // status(2) + count(2) + bodylen(4) + body
+
+  for (let i = 0; i < headerCount; i++) {
+    const name = headerKeys[i];
+    const nameBytes = getCachedHeaderNameBytes(name);
+    const valueBytes = textEncoder.encode(String(rawHeaders[name]));
     if (nameBytes.length > 0xff) {
       throw new Error(`Response header name too long: ${nameBytes.length}`);
     }
     if (valueBytes.length > 0xffff) {
       throw new Error(`Response header value too long: ${valueBytes.length}`);
     }
-    totalLength += 1 + 2 + nameBytes.length + valueBytes.length;
+    encodedHeaders[i] = [nameBytes, valueBytes];
+    totalLength += 3 + nameBytes.length + valueBytes.length;
   }
 
   const output = Buffer.allocUnsafe(totalLength);
-  const view = new DataView(output.buffer, output.byteOffset, output.byteLength);
   let offset = 0;
 
-  writeU16(view, offset, Number(snapshot.status ?? 200));
+  writeU16(output, offset, Number(snapshot.status ?? 200));
   offset += 2;
-  writeU16(view, offset, headers.length);
+  writeU16(output, offset, headerCount);
   offset += 2;
-  writeU32(view, offset, body.length);
+  writeU32(output, offset, body.length);
   offset += 4;
 
-  for (const [nameBytes, valueBytes] of headers) {
-    writeU8(view, offset, nameBytes.length);
-    offset += 1;
-    writeU16(view, offset, valueBytes.length);
+  for (let i = 0; i < headerCount; i++) {
+    const [nameBytes, valueBytes] = encodedHeaders[i];
+    output[offset++] = nameBytes.length;
+    writeU16(output, offset, valueBytes.length);
     offset += 2;
     output.set(nameBytes, offset);
     offset += nameBytes.length;
@@ -562,14 +591,6 @@ function materializeParamObject(entries, paramNames, plan) {
   return materializeSelectedParamPairs(entries, paramNames, plan.paramKeys);
 }
 
-function materializeHeaderObject(entries, plan) {
-  if (plan.fullHeaders) {
-    return materializePairs(entries, true);
-  }
-
-  return materializeSelectedPairs(entries, plan.headerKeys, true);
-}
-
 function materializeQueryObject(url, flags, plan) {
   if (!(flags & REQUEST_FLAG_QUERY_PRESENT)) {
     return Object.create(null);
@@ -580,23 +601,6 @@ function materializeQueryObject(url, flags, plan) {
   }
 
   return parseSelectedQuery(url, plan.queryKeys);
-}
-
-function materializePairs(entries, lowerCaseKeys = false) {
-  // Security: null-prototype object prevents prototype pollution
-  const result = Object.create(null);
-
-  for (const [rawName, rawValue] of entries) {
-    const name = textDecoder.decode(rawName);
-    const key = lowerCaseKeys ? name.toLowerCase() : name;
-    // Security: skip dangerous prototype keys
-    if (DANGEROUS_KEYS.has(key)) {
-      continue;
-    }
-    result[key] = textDecoder.decode(rawValue);
-  }
-
-  return result;
 }
 
 function materializeParamPairs(entries, paramNames) {
@@ -629,20 +633,21 @@ function materializeSelectedParamPairs(entries, paramNames, selectedKeys) {
   return result;
 }
 
-function materializeSelectedPairs(entries, selectedKeys, lowerCaseKeys = false) {
-  if (selectedKeys.size === 0) {
-    return Object.create(null);
+function materializeSelectedHeadersFromLookup(headerLookup, selectedKeys) {
+  if (selectedKeys.size === 0 || headerLookup === EMPTY_OBJECT) {
+    return EMPTY_OBJECT;
   }
 
   const result = Object.create(null);
-  for (const [rawName, rawValue] of entries) {
-    const name = textDecoder.decode(rawName);
-    const key = lowerCaseKeys ? name.toLowerCase() : name;
-    if (selectedKeys.has(key) && !DANGEROUS_KEYS.has(key)) {
-      result[key] = textDecoder.decode(rawValue);
+  for (const key of selectedKeys) {
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
+    const value = headerLookup[key];
+    if (value !== undefined) {
+      result[key] = value;
     }
   }
-
   return result;
 }
 
@@ -701,18 +706,31 @@ function pushQueryEntry(result, key, value) {
   result[key] = value;
 }
 
-function lookupHeaderValue(entries, targetName) {
-  for (const [rawName, rawValue] of entries) {
-    const name = textDecoder.decode(rawName).toLowerCase();
-    if (name === targetName) {
-      return textDecoder.decode(rawValue);
-    }
+function ensureHeaderLookup(req) {
+  if (req._headerLookup !== undefined) {
+    return req._headerLookup;
   }
 
-  return undefined;
+  const entries = req._decoded.rawHeaders;
+  if (entries.length === 0) {
+    req._headerLookup = EMPTY_OBJECT;
+    return req._headerLookup;
+  }
+
+  const result = Object.create(null);
+  for (const [rawName, rawValue] of entries) {
+    const name = textDecoder.decode(rawName).toLowerCase();
+    if (DANGEROUS_KEYS.has(name)) {
+      continue;
+    }
+    result[name] = textDecoder.decode(rawValue);
+  }
+
+  req._headerLookup = result;
+  return result;
 }
 
-// ─── Access Plan ──────────────────────────────────────────────────────────────
+// ─── Access Plan ────────────────────────
 
 function createEmptyAccessPlan() {
   return {
@@ -752,6 +770,23 @@ function normalizeHeaderLookup(value) {
   return String(value).toLowerCase();
 }
 
+function normalizeHeaderLookupCached(value) {
+  if (typeof value !== "string") {
+    return normalizeHeaderLookup(value);
+  }
+
+  const cached = headerLookupNameCache.get(value);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const normalized = value.toLowerCase();
+  if (headerLookupNameCache.size < HEADER_LOOKUP_CACHE_MAX) {
+    headerLookupNameCache.set(value, normalized);
+  }
+  return normalized;
+}
+
 function detectJsonFastPath(source) {
   if (!source.includes("res.json(")) {
     return "fallback";
@@ -782,7 +817,7 @@ function encodeUtf8(value) {
   return textEncoder.encode(String(value));
 }
 
-// ─── Binary Protocol Helpers ──────────────────────────────────────────────────
+// ─── Binary Protocol Helpers ────────────
 
 function readBytes(bytes, offset, length) {
   if (offset + length > bytes.byteLength) {
@@ -792,35 +827,40 @@ function readBytes(bytes, offset, length) {
   return bytes.subarray(offset, offset + length);
 }
 
-function readU8(view, offset) {
-  if (offset + 1 > view.byteLength) {
+function readU8(bytes, offset) {
+  if (offset + 1 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return view.getUint8(offset);
+  return bytes[offset];
 }
 
-function readU16(view, offset) {
-  if (offset + 2 > view.byteLength) {
+function readU16(bytes, offset) {
+  if (offset + 2 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return view.getUint16(offset, true);
+  return bytes[offset] | (bytes[offset + 1] << 8);
 }
 
-function readU32(view, offset) {
-  if (offset + 4 > view.byteLength) {
+function readU32(bytes, offset) {
+  if (offset + 4 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return view.getUint32(offset, true);
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24 >>> 0)
+  ) >>> 0;
 }
 
-function writeU8(view, offset, value) {
-  view.setUint8(offset, value);
+function writeU16(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
 }
 
-function writeU16(view, offset, value) {
-  view.setUint16(offset, value, true);
-}
-
-function writeU32(view, offset, value) {
-  view.setUint32(offset, value, true);
+function writeU32(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
+  bytes[offset + 2] = (value >>> 16) & 0xff;
+  bytes[offset + 3] = (value >>> 24) & 0xff;
 }

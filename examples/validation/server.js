@@ -3,7 +3,7 @@ import { validate } from "http-native/validate";
 
 const app = createApp();
 
-// ─── Manual Schema (no external deps) ─────────────────────────────────────────
+// ─── Manual Schema (no external deps) ───
 //
 // Works with any object that has .parse() or .safeParse().
 // Below is a minimal hand-rolled schema — in production, use Zod:
@@ -59,14 +59,14 @@ const QuerySchema = createSchema((data) => {
   return errors;
 });
 
-// ─── Error Handler ────────────────────────────────────────────────────────────
+// ─── Error Handler ──────────────────────
 
 app.onError((err, req, res) => {
   console.error(`Error: ${err.message}`);
   res.status(500).json({ error: "Internal server error" });
 });
 
-// ─── Routes with Validation ──────────────────────────────────────────────────
+// ─── Routes with Validation ────────────
 
 // Validates body against CreateUserSchema
 app.post(

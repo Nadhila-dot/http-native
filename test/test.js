@@ -164,6 +164,16 @@ async function main() {
     res.json(stablePayload);
   });
 
+  app.get("/native/:id", (req, res) => {
+    res.json({
+      id: req.params.id,
+      q: req.query.q,
+      tag: req.query.tag,
+      trace: req.header("x-trace"),
+      accept: req.headers.accept,
+    });
+  });
+
   app.get("/users/:id", async (req, res) => {
     const user = await db.getUser(req.params.id);
     res.json(user);
@@ -307,6 +317,24 @@ async function main() {
       accept: "application/json",
     });
 
+    const nativeResponse = await fetch(
+      new URL("/native/9?q=ada&tag=math&tag=logic", server.url),
+      {
+        headers: {
+          "x-trace": "native-fast",
+          accept: "application/json",
+        },
+      },
+    );
+    assert.equal(nativeResponse.status, 200);
+    assert.deepEqual(await nativeResponse.json(), {
+      id: "9",
+      q: "ada",
+      tag: ["math", "logic"],
+      trace: "native-fast",
+      accept: "application/json",
+    });
+
     const textResponse = await fetch(new URL("/text", server.url));
     assert.equal(textResponse.status, 200);
     assert.equal(await textResponse.text(), "hello from binary bridge");
@@ -384,6 +412,9 @@ async function main() {
     const userRoute = snapshot.routes.find(
       (route) => route.method === "GET" && route.path === "/users/:id",
     );
+    const nativeRoute = snapshot.routes.find(
+      (route) => route.method === "GET" && route.path === "/native/:id",
+    );
     const chainRoute = snapshot.routes.find(
       (route) => route.method === "GET" && route.path === "/chain/:id",
     );
@@ -394,6 +425,7 @@ async function main() {
     assert.ok(rootRoute);
     assert.ok(stableRoute);
     assert.ok(userRoute);
+    assert.ok(nativeRoute);
     assert.ok(chainRoute);
     assert.ok(fallbackRoute);
 
@@ -406,7 +438,7 @@ async function main() {
     assert.equal(stableRoute.bridgeObserved, true);
     assert.equal(stableRoute.cacheCandidate, true);
     assert.equal(stableRoute.hits, 32);
-    assert.equal(stableRoute.recommendation, "cache-candidate");
+    assert.equal(stableRoute.recommendation, null);
 
     assert.equal(userRoute.staticFastPath, false);
     assert.equal(userRoute.binaryBridge, true);
@@ -415,6 +447,12 @@ async function main() {
     assert.equal(userRoute.hits, 1);
     assert.equal(userRoute.dispatchKind, "specialized");
     assert.equal(userRoute.jsonFastPath, "generic");
+
+    assert.equal(nativeRoute.staticFastPath, false);
+    assert.equal(nativeRoute.bridgeObserved, false);
+    assert.equal(nativeRoute.hits, 0);
+    assert.equal(nativeRoute.dispatchKind, "specialized");
+    assert.equal(nativeRoute.jsonFastPath, "specialized");
 
     assert.equal(chainRoute.dispatchKind, "specialized");
     assert.equal(chainRoute.jsonFastPath, "specialized");

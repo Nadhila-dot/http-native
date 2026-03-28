@@ -1,19 +1,22 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
-const [, , engineArg, scenarioArg, portArg] = process.argv;
+const [, , engineArg, scenarioArg, portArg, runtimeArg] = process.argv;
 
 const engine = engineArg ?? "http-native";
 const scenario = scenarioArg ?? "static";
 const port = Number(portArg ?? 3001);
+const httpNativeRuntime = runtimeArg ?? "bun";
 
 function printUsage() {
-  console.log("Usage: bun bench/run.js <engine> <scenario> <port>");
+  console.log("Usage: bun bench/run.js <engine> <scenario> <port> [httpNativeRuntime]");
   console.log("Engines: http-native | bun | fiber | xitca | monoio | zig");
   console.log("Scenarios: static | dynamic | opt");
+  console.log("httpNativeRuntime: bun | node (only applies to http-native and old)");
   console.log("");
   console.log("Example:");
-  console.log("  bun bench/run.js http-native static 3001");
+  console.log("  bun bench/run.js http-native static 3001 bun");
+  console.log("  bun bench/run.js http-native static 3001 node");
   console.log("  bombardier -c 200 -d 10s http://127.0.0.1:3001/");
 }
 
@@ -39,6 +42,13 @@ async function main() {
     printUsage();
     process.exit(1);
   }
+
+  if (!["bun", "node"].includes(httpNativeRuntime)) {
+    printUsage();
+    process.exit(1);
+  }
+
+  const targetRuntime = engine === "http-native" || engine === "old" ? httpNativeRuntime : "bun";
 
   const child =
     engine === "xitca" || engine === "monoio"
@@ -74,7 +84,7 @@ async function main() {
             cwd: process.cwd(),
             stdio: ["ignore", "pipe", "inherit"],
           })
-        : spawn("bun", ["bench/target.js", engine, scenario, String(port)], {
+        : spawn(targetRuntime, ["bench/target.js", engine, scenario, String(port)], {
           cwd: process.cwd(),
           stdio: ["ignore", "pipe", "inherit"],
         });

@@ -2,7 +2,7 @@ import { createApp } from "http-native";
 
 const app = createApp();
 
-// ─── Logging Middleware (global) ──────────────────────────────────────────────
+// ─── Logging Middleware (global) ────────
 
 app.use(async (req, res, next) => {
   const start = performance.now();
@@ -14,7 +14,7 @@ app.use(async (req, res, next) => {
   console.log(`← ${req.method} ${req.path} [${duration}ms]`);
 });
 
-// ─── Auth Middleware (scoped to /api) ─────────────────────────────────────────
+// ─── Auth Middleware (scoped to /api) ───
 
 app.use("/api", async (req, res, next) => {
   const token = req.header("authorization");
@@ -39,7 +39,7 @@ app.use("/api", async (req, res, next) => {
   await next();
 });
 
-// ─── Request ID Middleware (global) ────────────────────────────────────────────
+// ─── Request ID Middleware (global) ──────
 
 app.use(async (req, res, next) => {
   const requestId = crypto.randomUUID();
@@ -48,7 +48,7 @@ app.use(async (req, res, next) => {
   await next();
 });
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Routes ─────────────────────────────
 
 // Public route (only logging + request ID middlewares run)
 app.get("/", (req, res) => {
@@ -70,7 +70,7 @@ app.get("/api/secret", (req, res) => {
   });
 });
 
-// ─── Error Handler ────────────────────────────────────────────────────────────
+// ─── Error Handler ──────────────────────
 
 app.onError((err, req, res) => {
   console.error(`❌ Error on ${req.method} ${req.path}:`, err.message);

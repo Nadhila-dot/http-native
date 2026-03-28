@@ -2,7 +2,6 @@ import { createApp } from "http-native";
 
 const app = createApp();
 
-// ─── Custom Error Classes ─────────────────────────────────────────────────────
 
 class AppError extends Error {
   constructor(message, statusCode = 500, code = "INTERNAL_ERROR") {
@@ -30,7 +29,7 @@ class UnauthorizedError extends AppError {
   }
 }
 
-// ─── Global Error Handler ─────────────────────────────────────────────────────
+// Global error handler
 
 app.onError((err, req, res) => {
   // Known application errors
@@ -58,7 +57,7 @@ app.onError((err, req, res) => {
   });
 });
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// Routes.
 
 app.get("/", (req, res) => {
   res.json({ status: "ok" });

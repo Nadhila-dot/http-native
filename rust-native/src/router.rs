@@ -3,14 +3,16 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 use crate::analyzer::{
-    analyze_route, normalize_path, parse_segments, AnalysisResult, RouteSegment,
+    analyze_dynamic_fast_path, analyze_route, normalize_path, parse_segments, AnalysisResult,
+    DynamicFastPathSpec, RouteSegment,
 };
-use crate::manifest::{ManifestInput, RouteInput};
+use crate::manifest::{ManifestInput, MiddlewareInput, RouteInput};
 
 const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
+const MAX_STACK_SEGMENTS: usize = 16;
 
-// ─── Public Types ─────────────────────────────────────────────────────────────
+// ─── Public Types ───────────────────────
 
 #[derive(Clone)]
 pub struct Router {
@@ -32,19 +34,27 @@ pub struct ExactStaticRoute {
 pub struct MatchedRoute<'a, 'b> {
     pub handler_id: u32,
     pub param_values: Vec<&'b str>,
+    pub param_names: &'a [Box<str>],
     pub header_keys: &'a [Box<str>],
     pub full_headers: bool,
+    pub needs_path: bool,
+    pub needs_url: bool,
+    pub needs_query: bool,
+    pub fast_path: Option<&'a DynamicFastPathSpec>,
 }
 
-// ─── Internal Types ───────────────────────────────────────────────────────────
+// ─── Internal Types ─────────────────────
 
 #[derive(Clone)]
 struct DynamicRouteSpec {
     handler_id: u32,
-    #[allow(dead_code)]
     param_names: Box<[Box<str>]>,
     header_keys: Box<[Box<str>]>,
     full_headers: bool,
+    needs_path: bool,
+    needs_url: bool,
+    needs_query: bool,
+    fast_path: Option<DynamicFastPathSpec>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -58,7 +68,7 @@ enum MethodKey {
     Put,
 }
 
-// ─── Radix Tree ───────────────────────────────────────────────────────────────
+// ─── Radix Tree ─────────────────────────
 //
 // Each node represents either a static prefix or a parameter capture.
 // Matching is O(M) where M is the number of path segments, not O(N) routes.
@@ -170,7 +180,7 @@ impl RadixNode {
     }
 }
 
-// ─── Router Implementation ────────────────────────────────────────────────────
+// ─── Router Implementation ──────────────
 
 impl Router {
     pub fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
@@ -225,13 +235,13 @@ impl Router {
                         .or_insert_with(HashMap::new)
                         .insert(
                             Box::<[u8]>::from(path.as_bytes()),
-                            compile_dynamic_route_spec(route),
+                            compile_dynamic_route_spec(route, &manifest.middlewares),
                         );
                 }
                 ROUTE_KIND_PARAM => {
                     // Insert into radix tree instead of linear Vec
                     let segments = parse_segments(path.as_str());
-                    let spec = compile_dynamic_route_spec(route);
+                    let spec = compile_dynamic_route_spec(route, &manifest.middlewares);
                     radix_trees
                         .entry(method_key)
                         .or_insert_with(RadixNode::new)
@@ -265,22 +275,38 @@ impl Router {
             return Some(MatchedRoute {
                 handler_id: route_spec.handler_id,
                 param_values: Vec::new(),
+                param_names: route_spec.param_names.as_ref(),
                 header_keys: route_spec.header_keys.as_ref(),
                 full_headers: route_spec.full_headers,
+                needs_path: route_spec.needs_path,
+                needs_url: route_spec.needs_url,
+                needs_query: route_spec.needs_query,
+                fast_path: route_spec.fast_path.as_ref(),
             });
         }
 
         // Radix tree match (O(M) where M = segment count)
-        let segments = split_request_segments(path);
         let tree = self.radix_trees.get(&method_key)?;
-        let mut param_values = Vec::new();
-        let spec = tree.match_path(&segments, &mut param_values)?;
+        let mut seg_buf = [""; MAX_STACK_SEGMENTS];
+        let seg_count = split_segments_stack(path, &mut seg_buf);
+        let mut param_values = Vec::with_capacity(4);
+        let spec = if seg_count <= MAX_STACK_SEGMENTS {
+            tree.match_path(&seg_buf[..seg_count], &mut param_values)?
+        } else {
+            let segments = split_request_segments(path);
+            tree.match_path(&segments, &mut param_values)?
+        };
 
         Some(MatchedRoute {
             handler_id: spec.handler_id,
             param_values,
+            param_names: spec.param_names.as_ref(),
             header_keys: spec.header_keys.as_ref(),
             full_headers: spec.full_headers,
+            needs_path: spec.needs_path,
+            needs_url: spec.needs_url,
+            needs_query: spec.needs_query,
+            fast_path: spec.fast_path.as_ref(),
         })
     }
 
@@ -300,7 +326,7 @@ impl Router {
     }
 }
 
-// ─── MethodKey ────────────────────────────────────────────────────────────────
+// ─── MethodKey ──────────────────────────
 
 impl MethodKey {
     fn from_method_str(method: &str) -> Option<Self> {
@@ -343,9 +369,9 @@ impl MethodKey {
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────
 
-fn compile_dynamic_route_spec(route: &RouteInput) -> DynamicRouteSpec {
+fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput]) -> DynamicRouteSpec {
     let param_names = route
         .param_names
         .iter()
@@ -364,6 +390,10 @@ fn compile_dynamic_route_spec(route: &RouteInput) -> DynamicRouteSpec {
         param_names,
         header_keys,
         full_headers: route.full_headers,
+        needs_path: route.needs_path,
+        needs_url: route.needs_url,
+        needs_query: route.needs_query,
+        fast_path: analyze_dynamic_fast_path(route, middlewares),
     }
 }
 
@@ -376,6 +406,27 @@ fn split_request_segments(path: &str) -> Vec<&str> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+/// Stack-allocated segment splitting — avoids heap Vec for paths with ≤ MAX_STACK_SEGMENTS segments.
+/// Returns the number of segments written into `buf`. If the path has more segments than `buf.len()`,
+/// returns `buf.len() + 1` as an overflow sentinel.
+fn split_segments_stack<'a>(path: &'a str, buf: &mut [&'a str]) -> usize {
+    if path == "/" {
+        return 0;
+    }
+    let mut count = 0;
+    for segment in path.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if count >= buf.len() {
+            return count + 1; // overflow sentinel
+        }
+        buf[count] = segment;
+        count += 1;
+    }
+    count
 }
 
 fn build_keep_alive_response(
@@ -424,6 +475,8 @@ fn build_response_bytes(
     response.extend_from_slice(body);
     response
 }
+
+// Todo: Are these expensive? if so remove them.
 
 fn status_reason(status: u16) -> &'static str {
     match status {

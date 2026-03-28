@@ -11,26 +11,36 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
   return {
     recordDispatch(route, _request, snapshot) {
       const entry = routesByHandlerId.get(route.handlerId);
-      if (!entry) {
+      if (!entry || entry.settled) {
         return;
       }
 
       entry.hits += 1;
-      entry.lastHitAt = new Date().toISOString();
       entry.bridgeObserved = true;
 
-      if (entry.stage === "cold" && entry.hits >= HOT_HIT_THRESHOLD) {
-        entry.stage = "hot";
-        maybeNotify(
-          notify,
-          entry,
-          entry.staticFastPath
-            ? `${entry.label} is serving from the static fast path`
-            : `${entry.label} is hot on bridge dispatch`,
-        );
+      if (entry.stage === "cold") {
+        if (entry.hits >= HOT_HIT_THRESHOLD) {
+          entry.stage = "hot";
+          entry.lastHitAt = Date.now();
+          maybeNotify(
+            notify,
+            entry,
+            entry.staticFastPath
+              ? `${entry.label} is serving from the static fast path`
+              : `${entry.label} is hot on bridge dispatch`,
+          );
+
+          // Non-cache candidates: no more recording needed
+          if (!entry.cacheCandidate) {
+            entry.settled = true;
+          }
+        }
+        return;
       }
 
+      // Only cache candidates reach here in "hot" stage
       if (!entry.cacheCandidate) {
+        entry.settled = true;
         return;
       }
 
@@ -47,6 +57,8 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
         entry.stableResponses >= STABLE_RESPONSE_THRESHOLD
       ) {
         entry.recommendation = "cache-candidate";
+        entry.settled = true;
+        entry.lastHitAt = Date.now();
         maybeNotify(
           notify,
           entry,
@@ -156,6 +168,7 @@ function buildRouteEntry(route, middlewares) {
     reasons,
     stableResponses: 0,
     lastResponseKey: null,
+    settled: false,
   };
 }
 

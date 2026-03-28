@@ -16,11 +16,16 @@ use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use url::form_urlencoded;
 
+use crate::analyzer::{
+    DynamicFastPathResponse, DynamicValueSourceKind, JsonTemplateKind, JsonValueTemplate,
+    TextSegment,
+};
 use crate::manifest::{HttpServerConfigInput, ManifestInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────
 // Gotta add support for these to be changed.
 
 const FALLBACK_DEFAULT_HOST: &str = "127.0.0.1";
@@ -34,8 +39,9 @@ const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
 const BRIDGE_VERSION: u8 = 1;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
 const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
+const UNKNOWN_METHOD_CODE: u8 = 0;
+/// Sentinel handler ID dispatched to JS when no route matches — JS treats this as 404.
 const NOT_FOUND_HANDLER_ID: u32 = 0;
-const NOT_FOUND_BODY: &[u8] = br#"{"error":"Route not found"}"#;
 
 /// Security: Maximum number of headers we allow per request
 const MAX_HEADER_COUNT: usize = 64;
@@ -55,7 +61,7 @@ const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
 
 type DispatchTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, Status, false, false, 0>;
 
-// ─── Thread-Local Buffer Pool ─────────────────────────────────────────────────
+// ─── Thread-Local Buffer Pool ───────────
 //
 // Eliminates per-connection Vec<u8> allocations by recycling buffers.
 
@@ -84,7 +90,7 @@ fn release_buffer(mut buf: Vec<u8>) {
     });
 }
 
-// ─── Server Configuration ─────────────────────────────────────────────────────
+// ─── Server Configuration ───────────────
 
 #[derive(Clone)]
 struct HttpServerConfig {
@@ -162,7 +168,7 @@ impl HttpServerConfig {
     }
 }
 
-// ─── NAPI Interface ───────────────────────────────────────────────────────────
+// ─── NAPI Interface ─────────────────────
 
 #[napi(object)]
 pub struct NativeListenOptions {
@@ -360,7 +366,7 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
         .unwrap_or(1)
 }
 
-// ─── JS Dispatcher ────────────────────────────────────────────────────────────
+// ─── JS Dispatcher ──────────────────────
 
 struct JsDispatcher {
     callback: DispatchTsfn,
@@ -380,7 +386,7 @@ impl JsDispatcher {
     }
 }
 
-// ─── Server Loop ──────────────────────────────────────────────────────────────
+// ─── Server Loop ────────────────────────
 
 async fn run_server(
     listener: TcpListener,
@@ -429,7 +435,7 @@ async fn run_server(
     Ok(())
 }
 
-// ─── Parsed Request (from httparse) ───────────────────────────────────────────
+// ─── Parsed Request (from httparse) ─────
 
 struct ParsedRequest<'a> {
     method: &'a [u8],
@@ -443,7 +449,7 @@ struct ParsedRequest<'a> {
     headers: Vec<(&'a str, &'a str)>,
 }
 
-// ─── Connection Handler with Buffer Pool ──────────────────────────────────────
+// ─── Connection Handler with Buffer Pool 
 
 async fn handle_connection(
     mut stream: TcpStream,
@@ -522,22 +528,11 @@ async fn handle_connection_inner(
         let has_body = parsed.has_body;
         let content_length = parsed.content_length;
 
-        // Extract owned copies from parsed (which borrows buffer) before we mutate buffer
-        let method_owned: Vec<u8> = parsed.method.to_vec();
-        let target_owned: Vec<u8> = parsed.target.to_vec();
-        let path_owned: Vec<u8> = parsed.path.to_vec();
-        let headers_owned: Vec<(String, String)> = parsed
-            .headers
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.to_string()))
-            .collect();
-
-        drop(parsed);
-
-        // ── Fast path: static routes (GET /) ──
-        if !has_body && method_owned == b"GET" {
-            if path_owned == b"/" {
+        // ── Fast path: static routes (zero-copy from borrowed parse data) ──
+        if !has_body && parsed.method == b"GET" {
+            if parsed.path == b"/" {
                 if let Some(static_route) = router.exact_get_root() {
+                    drop(parsed);
                     drain_consumed_bytes(buffer, header_bytes);
                     write_exact_static_response(stream, static_route, keep_alive).await?;
                     if !keep_alive {
@@ -547,7 +542,8 @@ async fn handle_connection_inner(
                     continue;
                 }
             }
-            if let Some(static_route) = router.exact_static_route(&method_owned, &path_owned) {
+            if let Some(static_route) = router.exact_static_route(parsed.method, parsed.path) {
+                drop(parsed);
                 drain_consumed_bytes(buffer, header_bytes);
                 write_exact_static_response(stream, static_route, keep_alive).await?;
                 if !keep_alive {
@@ -558,12 +554,48 @@ async fn handle_connection_inner(
             }
         }
 
-        // ── Read request body if present ──────────────────────────────
-        let body_bytes: Vec<u8> = if has_body {
+        // ── Zero-copy path: non-body requests ──
+        // Build dispatch envelope directly from borrowed parse data, avoiding
+        // String/Vec allocations for method, target, path, and headers.
+        if !has_body {
+            let dispatch_decision = build_dispatch_decision_zero_copy(router, &parsed, &[])?;
+            drop(parsed);
+            drain_consumed_bytes(buffer, header_bytes);
+
+            match dispatch_decision {
+                DispatchDecision::BridgeRequest(request) => {
+                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive)
+                        .await?;
+                }
+                DispatchDecision::SpecializedResponse(response) => {
+                    let (write_result, _) = stream.write_all(response).await;
+                    write_result?;
+                }
+            }
+
+            if !keep_alive {
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            continue;
+        }
+
+        // ── Body requests: need owned copies to release buffer for body read ──
+        let method_owned: Vec<u8> = parsed.method.to_vec();
+        let target_owned: Vec<u8> = parsed.target.to_vec();
+        let path_owned: Vec<u8> = parsed.path.to_vec();
+        let headers_owned: Vec<(String, String)> = parsed
+            .headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        drop(parsed);
+
+        // ── Read request body 
+        let body_bytes: Vec<u8> = {
             let content_length = match content_length {
                 Some(len) => len,
                 None => {
-                    // Chunked or unknown body length — reject for now
                     let response =
                         build_error_response_bytes(411, b"{\"error\":\"Length Required\"}", false);
                     let (write_result, _) = stream.write_all(response).await;
@@ -573,7 +605,6 @@ async fn handle_connection_inner(
                 }
             };
 
-            // Security: enforce max body size
             if content_length > MAX_BODY_BYTES {
                 let response =
                     build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
@@ -583,7 +614,6 @@ async fn handle_connection_inner(
                 return Ok(());
             }
 
-            // Some body bytes may already be in the buffer after the headers
             let already_in_buffer = if buffer.len() > header_bytes {
                 buffer.len() - header_bytes
             } else {
@@ -591,12 +621,10 @@ async fn handle_connection_inner(
             };
 
             if already_in_buffer >= content_length {
-                // Entire body is already in the buffer
                 let body = buffer[header_bytes..header_bytes + content_length].to_vec();
                 drain_consumed_bytes(buffer, header_bytes + content_length);
                 body
             } else {
-                // Need to read more bytes from the stream
                 let mut body = Vec::with_capacity(content_length);
                 if already_in_buffer > 0 {
                     body.extend_from_slice(&buffer[header_bytes..]);
@@ -609,19 +637,15 @@ async fn handle_connection_inner(
                     let (read_result, returned_buf) = stream.read(chunk_buf).await;
                     let bytes_read = read_result?;
                     if bytes_read == 0 {
-                        return Ok(()); // Connection closed mid-body
+                        return Ok(());
                     }
                     body.extend_from_slice(&returned_buf[..bytes_read]);
                 }
                 body.truncate(content_length);
                 body
             }
-        } else {
-            drain_consumed_bytes(buffer, header_bytes);
-            Vec::new()
         };
 
-        // Dynamic path: build bridge envelope and dispatch to JS
         let dispatch_request = build_dispatch_request_owned(
             router,
             &method_owned,
@@ -631,14 +655,7 @@ async fn handle_connection_inner(
             &body_bytes,
         )?;
 
-        match dispatch_request {
-            Some(request) => {
-                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive).await?;
-            }
-            None => {
-                write_not_found_response(stream, keep_alive).await?;
-            }
-        }
+        write_dynamic_dispatch_response(stream, dispatcher, dispatch_request, keep_alive).await?;
 
         if !keep_alive {
             stream.shutdown().await?;
@@ -647,7 +664,7 @@ async fn handle_connection_inner(
     }
 }
 
-// ─── httparse-based Request Parsing ───────────────────────────────────────────
+// ─── httparse-based Request Parsing ─────
 //
 // Uses the battle-tested `httparse` crate for RFC-compliant zero-copy parsing.
 // Single-pass: parses headers once and stores them for reuse by both the
@@ -740,7 +757,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
     })
 }
 
-// ─── Hot Root Path (GET /) ────────────────────────────────────────────────────
+// ─── Hot Root Path (GET /) ──────────────
 //
 // Ultra-fast path for the most common benchmark case. Falls back to httparse
 // if the request doesn't exactly match the expected prefix.
@@ -816,11 +833,76 @@ fn parse_hot_root_request(
     })
 }
 
-// ─── Routing ──────────────────────────────────────────────────────────────────
+// ─── Routing ────────────────────────────
 
 // ─── Bridge Envelope Building (Single-Pass Headers) ───────────────────────────
 //
 // Uses the pre-parsed headers from httparse — no second scan of the raw bytes.
+
+/// Zero-copy dispatch: builds the bridge envelope directly from borrowed parse data,
+/// avoiding all String/Vec allocations for method, target, path, and headers.
+/// Used for non-body requests (GET, DELETE without body, etc.).
+enum DispatchDecision {
+    BridgeRequest(Buffer),
+    SpecializedResponse(Vec<u8>),
+}
+
+fn build_dispatch_decision_zero_copy(
+    router: &Router,
+    parsed: &ParsedRequest<'_>,
+    body: &[u8],
+) -> Result<DispatchDecision> {
+    let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
+    let path_cow = String::from_utf8_lossy(parsed.path);
+    let path_str = path_cow.as_ref();
+    let url_cow = String::from_utf8_lossy(parsed.target);
+    let url_str = url_cow.as_ref();
+
+    let normalized_path = normalize_runtime_path(path_str);
+    if contains_path_traversal(&normalized_path) {
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &parsed.headers,
+            body,
+        )
+        .map(DispatchDecision::BridgeRequest);
+    }
+
+    let matched_route = if method_code == UNKNOWN_METHOD_CODE {
+        None
+    } else {
+        router.match_route(method_code, normalized_path.as_ref())
+    };
+
+    let Some(matched_route) = matched_route else {
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &parsed.headers,
+            body,
+        )
+        .map(DispatchDecision::BridgeRequest);
+    };
+
+    if let Some(response) =
+        build_dynamic_fast_path_response(&matched_route, url_str, &parsed.headers, parsed.keep_alive)?
+    {
+        return Ok(DispatchDecision::SpecializedResponse(response));
+    };
+
+    build_dispatch_envelope(
+        &matched_route,
+        method_code,
+        path_str,
+        url_str,
+        &parsed.headers,
+        body,
+    )
+    .map(DispatchDecision::BridgeRequest)
+}
 
 fn build_dispatch_request_owned(
     router: &Router,
@@ -829,40 +911,45 @@ fn build_dispatch_request_owned(
     path: &[u8],
     headers: &[(String, String)],
     body: &[u8],
-) -> Result<Option<Buffer>> {
-    let Some(method_code) = method_code_from_bytes(method) else {
-        return Ok(None);
-    };
+) -> Result<Buffer> {
+    let method_code = method_code_from_bytes(method).unwrap_or(UNKNOWN_METHOD_CODE);
 
-    let path_str = match std::str::from_utf8(path) {
-        Ok(path_str) => path_str,
-        Err(_) => return Ok(None),
-    };
-    let url_str = match std::str::from_utf8(target) {
-        Ok(url_str) => url_str,
-        Err(_) => return Ok(None),
-    };
-
-    // Security: strict path validation
-    let normalized_path = normalize_runtime_path(path_str);
-    if contains_path_traversal(&normalized_path) {
-        return Ok(None);
-    }
+    let path_cow = String::from_utf8_lossy(path);
+    let path_str = path_cow.as_ref();
+    let url_cow = String::from_utf8_lossy(target);
+    let url_str = url_cow.as_ref();
 
     let header_refs: Vec<(&str, &str)> = headers
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
 
-    let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
+    // Security: strict path validation
+    let normalized_path = normalize_runtime_path(path_str);
+    if contains_path_traversal(&normalized_path) {
         return build_not_found_dispatch_envelope(
             method_code,
             path_str,
             url_str,
             &header_refs,
             body,
-        )
-        .map(Some);
+        );
+    }
+
+    let matched_route = if method_code == UNKNOWN_METHOD_CODE {
+        None
+    } else {
+        router.match_route(method_code, normalized_path.as_ref())
+    };
+
+    let Some(matched_route) = matched_route else {
+        return build_not_found_dispatch_envelope(
+            method_code,
+            path_str,
+            url_str,
+            &header_refs,
+            body,
+        );
     };
 
     build_dispatch_envelope(
@@ -873,7 +960,6 @@ fn build_dispatch_request_owned(
         &header_refs,
         body,
     )
-    .map(Some)
 }
 
 fn build_not_found_dispatch_envelope(
@@ -934,10 +1020,12 @@ fn build_dispatch_envelope(
     header_entries: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Buffer> {
-    let url_bytes = url.as_bytes();
-    let path_bytes = path.as_bytes();
+    let include_url = matched_route.needs_url || matched_route.needs_query;
+    let include_path = matched_route.needs_path;
+    let url_bytes = if include_url { url.as_bytes() } else { b"" };
+    let path_bytes = if include_path { path.as_bytes() } else { b"" };
     let mut flags: u16 = 0;
-    if url.contains('?') {
+    if matched_route.needs_query && url.contains('?') {
         flags |= REQUEST_FLAG_QUERY_PRESENT;
     }
     if !body.is_empty() {
@@ -953,13 +1041,13 @@ fn build_dispatch_envelope(
     if matched_route.param_values.len() > u16::MAX as usize {
         return Err(anyhow!("too many params"));
     }
-    let selected_headers = select_header_entries(header_entries, matched_route);
-    if selected_headers.len() > u16::MAX as usize {
+    let selected_header_count = count_selected_headers(header_entries, matched_route);
+    if selected_header_count > u16::MAX as usize {
         return Err(anyhow!("too many headers"));
     }
 
     let mut frame = Vec::with_capacity(
-        20 + url_bytes.len() + path_bytes.len() + selected_headers.len() * 16 + body.len(),
+        20 + url_bytes.len() + path_bytes.len() + selected_header_count * 16 + body.len(),
     );
     frame.push(BRIDGE_VERSION);
     frame.push(method_code);
@@ -968,7 +1056,7 @@ fn build_dispatch_envelope(
     push_u32(&mut frame, url_bytes.len() as u32);
     push_u16(&mut frame, path_bytes.len() as u16);
     push_u16(&mut frame, matched_route.param_values.len() as u16);
-    push_u16(&mut frame, selected_headers.len() as u16);
+    push_u16(&mut frame, selected_header_count as u16);
     push_u32(&mut frame, body.len() as u32); // NEW: body length
     frame.extend_from_slice(url_bytes);
     frame.extend_from_slice(path_bytes);
@@ -977,8 +1065,12 @@ fn build_dispatch_envelope(
         push_string_value(&mut frame, value)?;
     }
 
-    for (name, value) in selected_headers {
-        push_string_pair(&mut frame, name, value)?;
+    if selected_header_count > 0 {
+        for (name, value) in header_entries {
+            if should_include_header(name, matched_route) {
+                push_string_pair(&mut frame, name, value)?;
+            }
+        }
     }
 
     frame.extend_from_slice(body); // NEW: body bytes at end
@@ -986,33 +1078,334 @@ fn build_dispatch_envelope(
     Ok(Buffer::from(frame))
 }
 
-fn select_header_entries<'a>(
-    header_entries: &[(&'a str, &'a str)],
+fn count_selected_headers(
+    header_entries: &[(&str, &str)],
     matched_route: &MatchedRoute<'_, '_>,
-) -> Vec<(&'a str, &'a str)> {
+) -> usize {
     if matched_route.full_headers {
-        return header_entries.to_vec();
+        return header_entries.len();
     }
 
     if matched_route.header_keys.is_empty() {
-        return Vec::new();
+        return 0;
     }
 
-    let mut selected = Vec::with_capacity(matched_route.header_keys.len());
-    for (name, value) in header_entries {
-        if matched_route
-            .header_keys
-            .iter()
-            .any(|target| target.as_ref().eq_ignore_ascii_case(name))
-        {
-            selected.push((*name, *value));
+    header_entries
+        .iter()
+        .filter(|(name, _)| should_include_header(name, matched_route))
+        .count()
+}
+
+fn should_include_header(name: &str, matched_route: &MatchedRoute<'_, '_>) -> bool {
+    if matched_route.full_headers {
+        return true;
+    }
+    matched_route
+        .header_keys
+        .iter()
+        .any(|target| target.as_ref().eq_ignore_ascii_case(name))
+}
+
+enum ResolvedDynamicValue {
+    Missing,
+    Single(String),
+    Multi(Vec<String>),
+}
+
+fn build_dynamic_fast_path_response(
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    keep_alive: bool,
+) -> Result<Option<Vec<u8>>> {
+    let Some(fast_path) = matched_route.fast_path else {
+        return Ok(None);
+    };
+
+    let mut query_cache: Option<Vec<(String, String)>> = None;
+    let body = match &fast_path.response {
+        DynamicFastPathResponse::Json(template) => {
+            render_dynamic_json_body(template, matched_route, url, headers, &mut query_cache)?
+        }
+        DynamicFastPathResponse::Text(template) => {
+            render_dynamic_text_body(template, matched_route, url, headers, &mut query_cache)
+        }
+    };
+
+    Ok(Some(build_response_bytes_fast(
+        fast_path.status,
+        fast_path.headers.as_ref(),
+        &body,
+        keep_alive,
+    )))
+}
+
+fn render_dynamic_json_body(
+    template: &crate::analyzer::JsonTemplate,
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    query_cache: &mut Option<Vec<(String, String)>>,
+) -> Result<Vec<u8>> {
+    match &template.kind {
+        JsonTemplateKind::Literal(bytes) => Ok(bytes.to_vec()),
+        JsonTemplateKind::Object(fields) => {
+            let mut output = Vec::with_capacity(fields.len() * 24 + 16);
+            output.push(b'{');
+            let mut wrote_field = false;
+
+            for field in fields.iter() {
+                match &field.value {
+                    JsonValueTemplate::Literal(value_bytes) => {
+                        if wrote_field {
+                            output.push(b',');
+                        }
+                        output.extend_from_slice(field.key_prefix.as_ref());
+                        output.extend_from_slice(value_bytes.as_ref());
+                        wrote_field = true;
+                    }
+                    JsonValueTemplate::Dynamic(source) => {
+                        let resolved =
+                            resolve_dynamic_value(source, matched_route, url, headers, query_cache);
+                        match resolved {
+                            ResolvedDynamicValue::Missing => {}
+                            ResolvedDynamicValue::Single(value) => {
+                                if wrote_field {
+                                    output.push(b',');
+                                }
+                                output.extend_from_slice(field.key_prefix.as_ref());
+                                append_json_string(&mut output, value.as_str());
+                                wrote_field = true;
+                            }
+                            ResolvedDynamicValue::Multi(values) => {
+                                if wrote_field {
+                                    output.push(b',');
+                                }
+                                output.extend_from_slice(field.key_prefix.as_ref());
+                                output.push(b'[');
+                                for (index, value) in values.iter().enumerate() {
+                                    if index > 0 {
+                                        output.push(b',');
+                                    }
+                                    append_json_string(&mut output, value.as_str());
+                                }
+                                output.push(b']');
+                                wrote_field = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            output.push(b'}');
+            Ok(output)
+        }
+    }
+}
+
+fn render_dynamic_text_body(
+    template: &crate::analyzer::TextTemplate,
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    query_cache: &mut Option<Vec<(String, String)>>,
+) -> Vec<u8> {
+    let mut output = String::new();
+    for segment in template.segments.iter() {
+        match segment {
+            TextSegment::Literal(value) => output.push_str(value.as_ref()),
+            TextSegment::Dynamic(source) => match resolve_dynamic_value(
+                source,
+                matched_route,
+                url,
+                headers,
+                query_cache,
+            ) {
+                ResolvedDynamicValue::Missing => output.push_str("undefined"),
+                ResolvedDynamicValue::Single(value) => output.push_str(value.as_str()),
+                ResolvedDynamicValue::Multi(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        if index > 0 {
+                            output.push(',');
+                        }
+                        output.push_str(value.as_str());
+                    }
+                }
+            },
         }
     }
 
-    selected
+    output.into_bytes()
 }
 
-// ─── Response Writing ─────────────────────────────────────────────────────────
+fn resolve_dynamic_value(
+    source: &crate::analyzer::DynamicValueSource,
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    query_cache: &mut Option<Vec<(String, String)>>,
+) -> ResolvedDynamicValue {
+    match source.kind {
+        DynamicValueSourceKind::Param => {
+            if let Some(value) = lookup_param_value(matched_route, source.key.as_ref()) {
+                return ResolvedDynamicValue::Single(value.to_string());
+            }
+            ResolvedDynamicValue::Missing
+        }
+        DynamicValueSourceKind::Header => {
+            if let Some(value) = lookup_header_value(headers, source.key.as_ref()) {
+                return ResolvedDynamicValue::Single(value.to_string());
+            }
+            ResolvedDynamicValue::Missing
+        }
+        DynamicValueSourceKind::Query => {
+            let entries = query_entries(url, query_cache);
+            lookup_query_value(entries.as_slice(), source.key.as_ref())
+        }
+    }
+}
+
+fn lookup_param_value<'m, 'r, 'p>(
+    matched_route: &'m MatchedRoute<'r, 'p>,
+    key: &str,
+) -> Option<&'p str> {
+    for (index, name) in matched_route.param_names.iter().enumerate() {
+        if name.as_ref() == key {
+            return matched_route.param_values.get(index).copied();
+        }
+    }
+    None
+}
+
+fn lookup_header_value<'a>(headers: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(key).then_some(*value))
+}
+
+fn query_entries<'a>(
+    url: &str,
+    cache: &'a mut Option<Vec<(String, String)>>,
+) -> &'a Vec<(String, String)> {
+    if cache.is_none() {
+        let parsed = if let Some(query_start) = url.find('?') {
+            let query = &url[query_start + 1..];
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        *cache = Some(parsed);
+    }
+
+    cache.as_ref().expect("query cache must be initialized")
+}
+
+fn lookup_query_value(entries: &[(String, String)], key: &str) -> ResolvedDynamicValue {
+    let mut values: Vec<String> = Vec::new();
+    for (entry_key, entry_value) in entries.iter() {
+        if entry_key == key {
+            values.push(entry_value.clone());
+        }
+    }
+
+    match values.len() {
+        0 => ResolvedDynamicValue::Missing,
+        1 => ResolvedDynamicValue::Single(values.pop().unwrap_or_default()),
+        _ => ResolvedDynamicValue::Multi(values),
+    }
+}
+
+fn append_json_string(output: &mut Vec<u8>, value: &str) {
+    output.push(b'"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.extend_from_slice(br#"\""#),
+            '\\' => output.extend_from_slice(br#"\\"#),
+            '\n' => output.extend_from_slice(br#"\n"#),
+            '\r' => output.extend_from_slice(br#"\r"#),
+            '\t' => output.extend_from_slice(br#"\t"#),
+            '\x08' => output.extend_from_slice(br#"\b"#),
+            '\x0C' => output.extend_from_slice(br#"\f"#),
+            other if other.is_control() => {
+                let escaped = format!("\\u{:04x}", other as u32);
+                output.extend_from_slice(escaped.as_bytes());
+            }
+            other => {
+                let mut buf = [0u8; 4];
+                output.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    output.push(b'"');
+}
+
+fn build_response_bytes_fast(
+    status: u16,
+    headers: &[(Box<str>, Box<str>)],
+    body: &[u8],
+    keep_alive: bool,
+) -> Vec<u8> {
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let body_len = body.len();
+
+    let mut total_size =
+        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        total_size += name.len() + 2 + value.len() + 2;
+    }
+
+    total_size += 2 + body_len;
+
+    let mut output = Vec::with_capacity(total_size);
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, body_len);
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(body);
+    output
+}
+
+// ─── Response Writing ───────────────────
 
 async fn write_exact_static_response(
     stream: &mut TcpStream,
@@ -1030,62 +1423,117 @@ async fn write_exact_static_response(
     Ok(())
 }
 
-#[derive(Clone)]
-struct DispatchResponseEnvelope {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Bytes,
-}
-
 async fn write_dynamic_dispatch_response(
     stream: &mut TcpStream,
     dispatcher: &JsDispatcher,
     request: Buffer,
     keep_alive: bool,
 ) -> Result<()> {
-    let parsed = match dispatcher.dispatch(request).await {
-        Ok(response) => match parse_dispatch_response(response.as_ref()) {
-            Ok(parsed) => parsed,
-            Err(_) => DispatchResponseEnvelope {
-                status: 500,
-                headers: vec![(
-                    "content-type".to_string(),
-                    "application/json; charset=utf-8".to_string(),
-                )],
-                // Security: sanitized error — no internal details
-                body: Bytes::from_static(b"{\"error\":\"Internal Server Error\"}"),
-            },
-        },
-        Err(_) => DispatchResponseEnvelope {
-            status: 502,
-            headers: vec![(
-                "content-type".to_string(),
-                "application/json; charset=utf-8".to_string(),
-            )],
+    match dispatcher.dispatch(request).await {
+        Ok(response) => {
+            match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
+                Ok(http_response) => {
+                    let (write_result, _) = stream.write_all(http_response).await;
+                    write_result?;
+                }
+                Err(_) => {
+                    // Security: sanitized error — no internal details
+                    let response = build_error_response_bytes(
+                        500,
+                        b"{\"error\":\"Internal Server Error\"}",
+                        keep_alive,
+                    );
+                    let (write_result, _) = stream.write_all(response).await;
+                    write_result?;
+                }
+            }
+        }
+        Err(_) => {
             // Security: sanitized error — no internal details
-            body: Bytes::from_static(b"{\"error\":\"Bad Gateway\"}"),
-        },
-    };
-
-    let response_bytes = build_dispatch_response_bytes(parsed, keep_alive);
-    let (write_result, _) = stream.write_all(response_bytes).await;
-    write_result?;
+            let response = build_error_response_bytes(
+                502,
+                b"{\"error\":\"Bad Gateway\"}",
+                keep_alive,
+            );
+            let (write_result, _) = stream.write_all(response).await;
+            write_result?;
+        }
+    }
     Ok(())
 }
 
-async fn write_not_found_response(stream: &mut TcpStream, keep_alive: bool) -> Result<()> {
-    let response = build_response_bytes(
-        404,
-        &[(
-            "content-type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        )],
-        Bytes::from_static(NOT_FOUND_BODY),
-        keep_alive,
-    );
-    let (write_result, _) = stream.write_all(response).await;
-    write_result?;
-    Ok(())
+/// Build HTTP response bytes directly from the binary dispatch envelope,
+/// avoiding all intermediate String/Bytes allocations.
+fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) -> Result<Vec<u8>> {
+    let mut offset = 0usize;
+    let status = read_u16(dispatch_bytes, &mut offset)?;
+    let header_count = read_u16(dispatch_bytes, &mut offset)? as usize;
+    let body_length = read_u32(dispatch_bytes, &mut offset)? as usize;
+
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+
+    // Conservative estimate: framing overhead + all dispatch bytes
+    let mut output = Vec::with_capacity(dispatch_bytes.len() + 128);
+
+    // Status line
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Mandatory headers
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, body_length);
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // User headers — read directly from binary without String allocation
+    for _ in 0..header_count {
+        let name_len = read_u8(dispatch_bytes, &mut offset)? as usize;
+        let value_len = read_u16(dispatch_bytes, &mut offset)? as usize;
+
+        if offset + name_len + value_len > dispatch_bytes.len() {
+            return Err(anyhow!("response envelope truncated"));
+        }
+
+        let name_bytes = &dispatch_bytes[offset..offset + name_len];
+        offset += name_len;
+        let value_bytes = &dispatch_bytes[offset..offset + value_len];
+        offset += value_len;
+
+        // Skip headers we already wrote
+        if name_bytes.eq_ignore_ascii_case(b"content-length")
+            || name_bytes.eq_ignore_ascii_case(b"connection")
+        {
+            continue;
+        }
+
+        // Security: CRLF injection check
+        if name_bytes.iter().any(|&b| b == b'\r' || b == b'\n')
+            || value_bytes.iter().any(|&b| b == b'\r' || b == b'\n')
+        {
+            continue;
+        }
+
+        output.extend_from_slice(name_bytes);
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value_bytes);
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+
+    // Body
+    if offset + body_length > dispatch_bytes.len() {
+        return Err(anyhow!("response body truncated"));
+    }
+    output.extend_from_slice(&dispatch_bytes[offset..offset + body_length]);
+
+    Ok(output)
 }
 
 /// Build a simple error response without going through the JS bridge
@@ -1097,15 +1545,6 @@ fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec
             "application/json; charset=utf-8".to_string(),
         )],
         Bytes::copy_from_slice(body),
-        keep_alive,
-    )
-}
-
-fn build_dispatch_response_bytes(response: DispatchResponseEnvelope, keep_alive: bool) -> Vec<u8> {
-    build_response_bytes(
-        response.status,
-        &response.headers,
-        response.body,
         keep_alive,
     )
 }
@@ -1183,36 +1622,7 @@ fn build_response_bytes(
     output
 }
 
-// ─── Response Parsing (from JS bridge) ────────────────────────────────────────
-
-fn parse_dispatch_response(bytes: &[u8]) -> Result<DispatchResponseEnvelope> {
-    let mut offset = 0;
-    let status = read_u16(bytes, &mut offset)?;
-    let header_count = read_u16(bytes, &mut offset)? as usize;
-    let body_length = read_u32(bytes, &mut offset)? as usize;
-
-    let mut headers = Vec::with_capacity(header_count);
-    for _ in 0..header_count {
-        let name_length = read_u8(bytes, &mut offset)? as usize;
-        let value_length = read_u16(bytes, &mut offset)? as usize;
-        let name = read_utf8(bytes, &mut offset, name_length)?;
-        let value = read_utf8(bytes, &mut offset, value_length)?;
-        headers.push((name, value));
-    }
-
-    if offset + body_length > bytes.len() {
-        return Err(anyhow!("response body truncated"));
-    }
-
-    let body = Bytes::copy_from_slice(&bytes[offset..offset + body_length]);
-    Ok(DispatchResponseEnvelope {
-        status,
-        headers,
-        body,
-    })
-}
-
-// ─── Security Utilities ───────────────────────────────────────────────────────
+// ─── Security Utilities ─────────────────
 
 /// Check for path traversal attempts (../, ..\, etc.)
 fn contains_path_traversal(path: &str) -> bool {
@@ -1251,7 +1661,7 @@ pub(crate) fn escape_json(value: &str) -> String {
     output
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────
 
 fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
     match method {
@@ -1463,18 +1873,6 @@ fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
         bytes[*offset + 3],
     ]);
     *offset += 4;
-    Ok(value)
-}
-
-fn read_utf8(bytes: &[u8], offset: &mut usize, length: usize) -> Result<String> {
-    if *offset + length > bytes.len() {
-        return Err(anyhow!("response envelope truncated"));
-    }
-
-    let value = std::str::from_utf8(&bytes[*offset..*offset + length])
-        .context("response envelope contained invalid utf-8")?
-        .to_string();
-    *offset += length;
     Ok(value)
 }
 

@@ -12,14 +12,14 @@ todos.set(2, { id: 2, title: "Build something awesome", completed: false });
 todos.set(3, { id: 3, title: "Deploy to production", completed: false });
 nextId = 4;
 
-// ─── Error Handler ────────────────────────────────────────────────────────────
+// ─── Error Handler ──────────────────────
 
 app.onError((err, req, res) => {
   console.error(`Error: ${err.message}`);
   res.status(500).json({ error: "Internal server error" });
 });
 
-// ─── List all todos ───────────────────────────────────────────────────────────
+// ─── List all todos ─────────────────────
 
 app.get("/todos", (req, res) => {
   const { completed } = req.query;
@@ -34,7 +34,7 @@ app.get("/todos", (req, res) => {
   res.json({ todos: items, count: items.length });
 });
 
-// ─── Get single todo ──────────────────────────────────────────────────────────
+// ─── Get single todo ────────────────────
 
 app.get("/todos/:id", (req, res) => {
   const id = Number(req.params.id);
@@ -48,7 +48,7 @@ app.get("/todos/:id", (req, res) => {
   res.json(todo);
 });
 
-// ─── Create todo ──────────────────────────────────────────────────────────────
+// ─── Create todo ────────────────────────
 
 app.post("/todos", (req, res) => {
   const body = req.json();
@@ -68,7 +68,7 @@ app.post("/todos", (req, res) => {
   res.status(201).json(todo);
 });
 
-// ─── Update todo ──────────────────────────────────────────────────────────────
+// ─── Update todo ────────────────────────
 
 app.put("/todos/:id", (req, res) => {
   const id = Number(req.params.id);
@@ -90,7 +90,7 @@ app.put("/todos/:id", (req, res) => {
   res.json(updated);
 });
 
-// ─── Delete todo ──────────────────────────────────────────────────────────────
+// ─── Delete todo ────────────────────────
 
 app.delete("/todos/:id", (req, res) => {
   const id = Number(req.params.id);
@@ -104,7 +104,7 @@ app.delete("/todos/:id", (req, res) => {
   res.sendStatus(204);
 });
 
-// ─── Toggle completion ────────────────────────────────────────────────────────
+// ─── Toggle completion ──────────────────
 
 app.patch("/todos/:id/toggle", (req, res) => {
   const id = Number(req.params.id);

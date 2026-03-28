@@ -42,4 +42,10 @@ pub struct RouteInput {
     pub segment_count: u16,
     pub header_keys: Vec<String>,
     pub full_headers: bool,
+    #[serde(default)]
+    pub needs_path: bool,
+    #[serde(default)]
+    pub needs_url: bool,
+    #[serde(default)]
+    pub needs_query: bool,
 }

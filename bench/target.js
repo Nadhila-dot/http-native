@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 
 process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
+process.env.HTTP_NATIVE_NATIVE_PATH ??= process.env.HTTP_NATIVE_NODE_PATH;
 
 const { createApp: createHttpNativeApp } = await import("../src/index.js");
 
@@ -124,7 +125,7 @@ async function startFrameworkServer(createApp, label, activeScenario) {
     port,
     opt:
       label === "http-native" && activeScenario === "opt"
-        ? { notify: true }
+        ? { notify: true, cache: true }
         : undefined,
   });
 

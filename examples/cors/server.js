@@ -3,13 +3,13 @@ import { cors } from "http-native/cors";
 
 const app = createApp();
 
-// ─── Example 1: Allow all origins ─────────────────────────────────────────────
+// ─── Example 1: Allow all origins ───────
 // app.use(cors());
 
-// ─── Example 2: Allow specific origin ─────────────────────────────────────────
+// ─── Example 2: Allow specific origin ───
 // app.use(cors({ origin: "https://myapp.com" }));
 
-// ─── Example 3: Allow multiple origins ────────────────────────────────────────
+// ─── Example 3: Allow multiple origins ──
 // app.use(cors({ origin: ["https://myapp.com", "https://admin.myapp.com"] }));
 
 // ─── Example 4: Dynamic origin with credentials ──────────────────────────────
@@ -29,7 +29,7 @@ app.use(
   }),
 );
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Routes ─────────────────────────────
 
 app.get("/api/data", (req, res) => {
   res.set("X-Request-Id", crypto.randomUUID()).json({

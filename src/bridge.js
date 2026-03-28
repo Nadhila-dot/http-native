@@ -419,31 +419,30 @@ export function createJsonSerializer(mode = "fallback") {
 
 export function decodeRequestEnvelope(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = 0;
 
-  const version = readU8(view, offset);
+  const version = readU8(bytes, offset);
   offset += 1;
   if (version !== BRIDGE_VERSION) {
     throw new Error(`Unsupported request envelope version ${version}`);
   }
 
-  const methodCode = readU8(view, offset);
+  const methodCode = readU8(bytes, offset);
   offset += 1;
-  const flags = readU16(view, offset);
+  const flags = readU16(bytes, offset);
   offset += 2;
-  const handlerId = readU32(view, offset);
+  const handlerId = readU32(bytes, offset);
   offset += 4;
-  const urlLength = readU32(view, offset);
+  const urlLength = readU32(bytes, offset);
   offset += 4;
-  const pathLength = readU16(view, offset);
+  const pathLength = readU16(bytes, offset);
   offset += 2;
-  const paramCount = readU16(view, offset);
+  const paramCount = readU16(bytes, offset);
   offset += 2;
-  const headerCount = readU16(view, offset);
+  const headerCount = readU16(bytes, offset);
   offset += 2;
 
-  const bodyLength = readU32(view, offset);
+  const bodyLength = readU32(bytes, offset);
   offset += 4;
 
   const urlBytes = readBytes(bytes, offset, urlLength);
@@ -451,20 +450,20 @@ export function decodeRequestEnvelope(buffer) {
   const pathBytes = readBytes(bytes, offset, pathLength);
   offset += pathLength;
 
-  const paramValues = new Array(paramCount);
+  const paramValues = paramCount === 0 ? EMPTY_ARRAY : new Array(paramCount);
   for (let index = 0; index < paramCount; index += 1) {
-    const valueLength = readU16(view, offset);
+    const valueLength = readU16(bytes, offset);
     offset += 2;
     const valueBytes = readBytes(bytes, offset, valueLength);
     offset += valueLength;
     paramValues[index] = valueBytes;
   }
 
-  const rawHeaders = new Array(headerCount);
+  const rawHeaders = headerCount === 0 ? EMPTY_ARRAY : new Array(headerCount);
   for (let index = 0; index < headerCount; index += 1) {
-    const nameLength = readU8(view, offset);
+    const nameLength = readU8(bytes, offset);
     offset += 1;
-    const valueLength = readU16(view, offset);
+    const valueLength = readU16(bytes, offset);
     offset += 2;
     const nameBytes = readBytes(bytes, offset, nameLength);
     offset += nameLength;
@@ -545,20 +544,19 @@ export function encodeResponseEnvelope(snapshot) {
   }
 
   const output = Buffer.allocUnsafe(totalLength);
-  const view = new DataView(output.buffer, output.byteOffset, output.byteLength);
   let offset = 0;
 
-  view.setUint16(offset, Number(snapshot.status ?? 200), true);
+  writeU16(output, offset, Number(snapshot.status ?? 200));
   offset += 2;
-  view.setUint16(offset, headerCount, true);
+  writeU16(output, offset, headerCount);
   offset += 2;
-  view.setUint32(offset, body.length, true);
+  writeU32(output, offset, body.length);
   offset += 4;
 
   for (let i = 0; i < headerCount; i++) {
     const [nameBytes, valueBytes] = encodedHeaders[i];
     output[offset++] = nameBytes.length;
-    view.setUint16(offset, valueBytes.length, true);
+    writeU16(output, offset, valueBytes.length);
     offset += 2;
     output.set(nameBytes, offset);
     offset += nameBytes.length;
@@ -812,35 +810,40 @@ function readBytes(bytes, offset, length) {
   return bytes.subarray(offset, offset + length);
 }
 
-function readU8(view, offset) {
-  if (offset + 1 > view.byteLength) {
+function readU8(bytes, offset) {
+  if (offset + 1 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return view.getUint8(offset);
+  return bytes[offset];
 }
 
-function readU16(view, offset) {
-  if (offset + 2 > view.byteLength) {
+function readU16(bytes, offset) {
+  if (offset + 2 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return view.getUint16(offset, true);
+  return bytes[offset] | (bytes[offset + 1] << 8);
 }
 
-function readU32(view, offset) {
-  if (offset + 4 > view.byteLength) {
+function readU32(bytes, offset) {
+  if (offset + 4 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return view.getUint32(offset, true);
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24 >>> 0)
+  ) >>> 0;
 }
 
-function writeU8(view, offset, value) {
-  view.setUint8(offset, value);
+function writeU16(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
 }
 
-function writeU16(view, offset, value) {
-  view.setUint16(offset, value, true);
-}
-
-function writeU32(view, offset, value) {
-  view.setUint32(offset, value, true);
+function writeU32(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
+  bytes[offset + 2] = (value >>> 16) & 0xff;
+  bytes[offset + 3] = (value >>> 24) & 0xff;
 }

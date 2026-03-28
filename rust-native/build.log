@@ -1,0 +1,20 @@
+warning: variable does not need to be mutable
+    --> src/lib.rs:1638:9
+     |
+1638 |     let mut total_size =
+     |         ----^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `build_response_bytes` is never used
+    --> src/lib.rs:1657:4
+     |
+1657 | fn build_response_bytes(
+     |    ^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `http_native_napi` (lib) generated 2 warnings (run `cargo fix --lib -p http_native_napi` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s

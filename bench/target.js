@@ -124,7 +124,7 @@ async function startFrameworkServer(createApp, label, activeScenario) {
     port,
     opt:
       label === "http-native" && activeScenario === "opt"
-        ? { notify: true }
+        ? { notify: true, cache: true }
         : undefined,
   });
 

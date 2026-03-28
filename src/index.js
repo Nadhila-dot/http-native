@@ -20,6 +20,7 @@ const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
 const NOOP_NEXT = () => undefined;
+const ROUTE_CACHE_PROMOTE_HITS = 16;
 const ERROR_REQUEST_PLAN = Object.freeze({
   method: true,
   path: true,
@@ -425,6 +426,11 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
       return serializeErrorResponse(new Error(`Unknown handler id ${decoded.handlerId}`));
     }
 
+    const cachedResponse = route.runtimeResponseCache?.encoded;
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+
     const req = route.requestFactory(decoded);
     const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
 
@@ -448,6 +454,7 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     const responseSnapshot = snapshot();
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
     const encoded = encodeResponseEnvelope(responseSnapshot);
+    maybePromoteRouteResponseCache(route, responseSnapshot, encoded);
     releaseRequestObject(req);
     release();
     return encoded;
@@ -478,7 +485,112 @@ function compileMiddlewareRegistration(middleware) {
   };
 }
 
-function compileRouteDispatch(route, middlewares) {
+function createRouteResponseCache(route, applicableMiddlewares, requestPlan, optConfig) {
+  if (optConfig?.cache !== true) {
+    return null;
+  }
+
+  if (route.method !== "GET" || route.path.includes(":")) {
+    return null;
+  }
+
+  if (applicableMiddlewares.length > 0) {
+    return null;
+  }
+
+  if (!hasNoRequestAccess(requestPlan)) {
+    return null;
+  }
+
+  const source = route.handlerSource ?? "";
+  if (source.includes("await")) {
+    return null;
+  }
+
+  if (/Date\.now|new Date|Math\.random|crypto\./.test(source)) {
+    return null;
+  }
+
+  return {
+    encoded: null,
+    lastKey: "",
+    stableHits: 0,
+  };
+}
+
+function hasNoRequestAccess(plan) {
+  return (
+    plan.method !== true &&
+    plan.path !== true &&
+    plan.url !== true &&
+    plan.fullParams !== true &&
+    plan.fullQuery !== true &&
+    plan.fullHeaders !== true &&
+    plan.paramKeys.size === 0 &&
+    plan.queryKeys.size === 0 &&
+    plan.headerKeys.size === 0
+  );
+}
+
+function maybePromoteRouteResponseCache(route, snapshot, encoded) {
+  const cache = route.runtimeResponseCache;
+  if (!cache || cache.encoded) {
+    return;
+  }
+
+  const key = buildSnapshotCacheKey(snapshot);
+  if (key === cache.lastKey) {
+    cache.stableHits += 1;
+  } else {
+    cache.lastKey = key;
+    cache.stableHits = 1;
+  }
+
+  if (cache.stableHits >= ROUTE_CACHE_PROMOTE_HITS) {
+    cache.encoded = encoded;
+  }
+}
+
+function buildSnapshotCacheKey(snapshot) {
+  let hash = 0x811c9dc5;
+  hash = fnv1aString(hash, String(snapshot.status ?? 200));
+
+  const headers = snapshot.headers ?? Object.create(null);
+  const headerNames = Object.keys(headers);
+  for (const name of headerNames) {
+    hash = fnv1aString(hash, name);
+    hash = fnv1aString(hash, String(headers[name]));
+  }
+
+  const body = Buffer.isBuffer(snapshot.body)
+    ? snapshot.body
+    : snapshot.body instanceof Uint8Array
+      ? snapshot.body
+      : EMPTY_BUFFER;
+  hash = fnv1aBytes(hash, body);
+
+  return `${hash}:${body.length}:${headerNames.length}`;
+}
+
+function fnv1aString(seed, value) {
+  let hash = seed >>> 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function fnv1aBytes(seed, bytes) {
+  let hash = seed >>> 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash ^= bytes[index];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function compileRouteDispatch(route, middlewares, optConfig = {}) {
   const applicableMiddlewares = middlewares.filter((middleware) =>
     pathPrefixMatches(middleware.pathPrefix, route.path),
   );
@@ -509,6 +621,7 @@ function compileRouteDispatch(route, middlewares) {
     dispatchKind: requestPlan.dispatchKind,
     jsonFastPath,
     jsonSerializer: createJsonSerializer(jsonFastPath),
+    runtimeResponseCache: createRouteResponseCache(route, applicableMiddlewares, requestPlan, optConfig),
   };
 }
 
@@ -607,7 +720,7 @@ export function createApp() {
         };
       });
       const compiledRoutes = routes.map((route) =>
-        compileRouteDispatch(route, compiledMiddlewares),
+        compileRouteDispatch(route, compiledMiddlewares, normalizedOptions.opt),
       );
 
       const manifest = {

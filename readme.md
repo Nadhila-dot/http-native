@@ -34,7 +34,7 @@ const db = {
   async getUser(id) {
     return {
       id,
-      name: "Ada Lovelace",
+      name: "Ada wong",
       role: "admin",
     };
   },

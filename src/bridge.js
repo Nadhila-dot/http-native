@@ -609,10 +609,12 @@ export function encodeResponseEnvelope(snapshot) {
       : Buffer.alloc(0);
 
   // Encode headers inline — avoids Object.entries().map() intermediate arrays
+  const ncache = snapshot.ncache || null;
   const headerKeys = rawHeaders ? Object.keys(rawHeaders) : EMPTY_ARRAY;
   const headerCount = headerKeys.length;
   const encodedHeaders = new Array(headerCount);
-  let totalLength = 8 + body.length; // status(2) + count(2) + bodylen(4) + body
+  // status(2) + count(2) + bodylen(4) + body + optional ncache trailer(10)
+  let totalLength = 8 + body.length + (ncache ? 10 : 0);
 
   for (let i = 0; i < headerCount; i++) {
     const name = headerKeys[i];
@@ -650,6 +652,18 @@ export function encodeResponseEnvelope(snapshot) {
   }
 
   output.set(body, offset);
+  offset += body.length;
+
+  // Append ncache trailer: magic(2) | ttlSecs(4) | maxEntries(4)
+  if (ncache) {
+    output[offset] = 0xca;
+    output[offset + 1] = 0xce;
+    offset += 2;
+    writeU32(output, offset, ncache.ttl);
+    offset += 4;
+    writeU32(output, offset, ncache.maxEntries);
+  }
+
   return output;
 }
 

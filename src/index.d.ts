@@ -70,6 +70,16 @@ export interface Response {
 
   /** Set status and send status code as text body */
   sendStatus(code: number): Response;
+
+  /**
+   * Send a JSON response and cache it in the Rust native layer.
+   * Subsequent requests are served directly from Rust without crossing the JS bridge.
+   *
+   * @param data - JSON-serializable response data
+   * @param ttl  - Cache TTL in seconds
+   * @param options.maxEntries - Max LRU entries per route (default 256)
+   */
+  ncache(data: unknown, ttl: number, options?: { maxEntries?: number }): Response;
 }
 
 export type NextFunction = () => Promise<void>;

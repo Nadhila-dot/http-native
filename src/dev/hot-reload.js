@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, watch } from "node:fs";
 import path from "node:path";
 
-const DEFAULT_WATCH_ROOTS = ["src", "rust-native/src", "test"];
+const DEFAULT_WATCH_ROOTS = ["src", "rsrc/src", ".github/tests"];
 const DEFAULT_DEBOUNCE_MS = 120;
 const WATCHED_EXTENSIONS = new Set([
   ".js",
@@ -19,7 +19,7 @@ const IGNORED_SEGMENTS = new Set([
   "node_modules",
   ".git",
   "target",
-  "bench/results",
+  ".github/bench/results",
   ".http-native",
 ]);
 

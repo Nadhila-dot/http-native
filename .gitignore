@@ -1,7 +1,5 @@
 node_modules/
 target/
-rust-native/target/
-old/native/target/
 .DS_Store
 http-native.node
 http-native.debug.node
@@ -13,5 +11,5 @@ old/
 #opt/
 .zig-cache
 zig-httpz
-bench/results/
+.github/bench/results/
 testing/

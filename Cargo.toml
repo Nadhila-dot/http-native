@@ -5,6 +5,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
+path = "rsrc/src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"

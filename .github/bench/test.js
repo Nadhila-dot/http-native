@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { createApp } from "../src/index.js";
+import { createApp } from "../../src/index.js";
 
 const db = {
   async getUser(id) {

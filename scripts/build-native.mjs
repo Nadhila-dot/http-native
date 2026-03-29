@@ -11,7 +11,7 @@ const cargoArgs = ["build"];
 if (release) {
   cargoArgs.push("--release");
 }
-cargoArgs.push("--manifest-path", "rust-native/Cargo.toml");
+cargoArgs.push("--manifest-path", "Cargo.toml");
 
 const result = Bun.spawnSync({
   cmd: ["cargo", ...cargoArgs],
@@ -32,7 +32,7 @@ const platformArtifact =
       ? "http_native_napi.dll"
       : "libhttp_native_napi.so";
 
-const source = resolve(`rust-native/target/${profile}/${platformArtifact}`);
+const source = resolve(`target/${profile}/${platformArtifact}`);
 const profileTarget = resolve(`http-native.${profile}.node`);
 const defaultTarget = resolve("http-native.node");
 

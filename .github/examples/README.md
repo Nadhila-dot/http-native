@@ -7,12 +7,12 @@ Each folder contains a self-contained example you can run with `bun`:
 bun run build
 
 # Then run any example
-bun examples/basic/server.js
-bun examples/cors/server.js
-bun examples/middleware/server.js
-bun examples/rest-api/server.js
-bun examples/validation/server.js
-bun examples/error-handling/server.js
+bun .github/examples/basic/server.js
+bun .github/examples/cors/server.js
+bun .github/examples/middleware/server.js
+bun .github/examples/rest-api/server.js
+bun .github/examples/validation/server.js
+bun .github/examples/error-handling/server.js
 ```
 
 ## Examples

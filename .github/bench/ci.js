@@ -10,7 +10,7 @@ const DEFAULT_SCENARIOS = ["static", "dynamic", "opt"];
 const DEFAULT_CONNECTIONS = 200;
 const DEFAULT_DURATION = "10s";
 const DEFAULT_TIMEOUT = "2s";
-const DEFAULT_OUTPUT_DIR = "bench/results";
+const DEFAULT_OUTPUT_DIR = ".github/bench/results";
 const DEFAULT_HTTP_NATIVE_RUNTIME = "bun";
 const DEFAULT_BOMBARDIER_BIN = resolveBombardierBin();
 const SUPPORTED_HTTP_NATIVE_RUNTIMES = new Set(["bun", "node"]);
@@ -155,7 +155,7 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-  console.log("Usage: bun bench/ci.js [options]");
+  console.log("Usage: bun .github/bench/ci.js [options]");
   console.log("");
   console.log("Options:");
   console.log(`  --engines=http-native,bun   Comma-separated list. Default: ${DEFAULT_ENGINES.join(",")}`);
@@ -327,7 +327,7 @@ async function runBenchmarkCase(testCase, options) {
 function spawnServer(testCase, options) {
   if (testCase.engine === "bun" || testCase.engine === "http-native" || testCase.engine === "old") {
     const runtime = testCase.engine === "bun" ? "bun" : options.httpNativeRuntime;
-    return spawn(runtime, ["bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
+    return spawn(runtime, [".github/bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
       cwd: process.cwd(),
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
@@ -335,7 +335,7 @@ function spawnServer(testCase, options) {
   }
 
   if (testCase.engine === "fiber") {
-    const cwd = resolve(process.cwd(), "bench/fiber-server");
+    const cwd = resolve(process.cwd(), ".github/bench/fiber-server");
     if (!existsSync(resolve(cwd, "go.mod"))) {
       throw new Error(`Missing Fiber benchmark target at ${cwd}`);
     }
@@ -348,7 +348,7 @@ function spawnServer(testCase, options) {
   }
 
   if (testCase.engine === "zig") {
-    const cwd = resolve(process.cwd(), "bench/zig-httpz");
+    const cwd = resolve(process.cwd(), ".github/bench/zig-httpz");
     if (!existsSync(cwd)) {
       throw new Error(`Missing Zig benchmark target at ${cwd}`);
     }
@@ -362,8 +362,8 @@ function spawnServer(testCase, options) {
   if (testCase.engine === "xitca" || testCase.engine === "monoio") {
     const manifestPath =
       testCase.engine === "xitca"
-        ? resolve(process.cwd(), "bench/xitca-server/Cargo.toml")
-        : resolve(process.cwd(), "bench/monoio-server/Cargo.toml");
+        ? resolve(process.cwd(), ".github/bench/xitca-server/Cargo.toml")
+        : resolve(process.cwd(), ".github/bench/monoio-server/Cargo.toml");
 
     if (!existsSync(manifestPath)) {
       throw new Error(`Missing Rust benchmark target at ${manifestPath}`);

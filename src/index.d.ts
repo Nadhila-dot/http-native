@@ -176,7 +176,7 @@ export interface RuntimeOptimizationOptions {
   cache?: boolean;
   /** Restart process on JS/Rust source changes (dev only, default: false) */
   hotReload?: boolean;
-  /** Watch roots for hot reload (default: ["src", "rust-native/src", "test"]) */
+  /** Watch roots for hot reload (default: ["src", "rsrc/src", ".github/tests"]) */
   hotReloadPaths?: string[];
   /** Debounce window for restart triggers in ms (default: 120) */
   hotReloadDebounceMs?: number;

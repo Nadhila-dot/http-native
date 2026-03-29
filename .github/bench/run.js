@@ -9,14 +9,14 @@ const port = Number(portArg ?? 3001);
 const httpNativeRuntime = runtimeArg ?? "bun";
 
 function printUsage() {
-  console.log("Usage: bun bench/run.js <engine> <scenario> <port> [httpNativeRuntime]");
+  console.log("Usage: bun .github/bench/run.js <engine> <scenario> <port> [httpNativeRuntime]");
   console.log("Engines: http-native | bun | fiber | xitca | monoio | zig");
   console.log("Scenarios: static | dynamic | opt");
   console.log("httpNativeRuntime: bun | node (only applies to http-native and old)");
   console.log("");
   console.log("Example:");
-  console.log("  bun bench/run.js http-native static 3001 bun");
-  console.log("  bun bench/run.js http-native static 3001 node");
+  console.log("  bun .github/bench/run.js http-native static 3001 bun");
+  console.log("  bun .github/bench/run.js http-native static 3001 node");
   console.log("  bombardier -c 200 -d 10s http://127.0.0.1:3001/");
 }
 
@@ -59,8 +59,8 @@ async function main() {
           "--release",
           "--manifest-path",
           engine === "xitca"
-            ? "bench/xitca-server/Cargo.toml"
-            : "bench/monoio-server/Cargo.toml",
+            ? ".github/bench/xitca-server/Cargo.toml"
+            : ".github/bench/monoio-server/Cargo.toml",
           "--",
           scenario,
           String(port),
@@ -75,16 +75,16 @@ async function main() {
           "zig",
           ["build", "run", "-Doptimize=ReleaseFast", "--", scenario, String(port)],
           {
-            cwd: `${process.cwd()}/bench/zig-httpz`,
+            cwd: `${process.cwd()}/.github/bench/zig-httpz`,
             stdio: ["ignore", "pipe", "inherit"],
           },
         )
         : engine === "fiber"
-          ? spawn("go", ["run", "./bench/fiber-server", scenario, String(port)], {
+          ? spawn("go", ["run", "./.github/bench/fiber-server", scenario, String(port)], {
             cwd: process.cwd(),
             stdio: ["ignore", "pipe", "inherit"],
           })
-        : spawn(targetRuntime, ["bench/target.js", engine, scenario, String(port)], {
+        : spawn(targetRuntime, [".github/bench/target.js", engine, scenario, String(port)], {
           cwd: process.cwd(),
           stdio: ["ignore", "pipe", "inherit"],
         });

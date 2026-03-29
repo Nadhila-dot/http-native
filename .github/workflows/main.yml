@@ -68,8 +68,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust-native/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-native/Cargo.lock', 'rust-native/Cargo.toml') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -77,7 +77,6 @@ jobs:
         run: bun install
 
       - name: Build Rust native module
-        working-directory: rust-native
         run: |
           cargo build --release
           echo "Rust native module built successfully"
@@ -104,39 +103,39 @@ jobs:
 
       - name: Create output directories
         run: |
-          mkdir -p bench/results/bun
-          mkdir -p bench/results/node
+          mkdir -p .github/bench/results/bun
+          mkdir -p .github/bench/results/node
 
       - name: Run benchmarks (http-native on Bun + selected engines)
         run: |
-          bun bench/ci.js \
+          bun .github/bench/ci.js \
             --engines="${{ inputs.engines || 'http-native,bun' }}" \
             --scenarios="${{ inputs.scenarios || 'static,dynamic,opt' }}" \
             --connections="${{ inputs.connections || '200' }}" \
             --duration="${{ inputs.duration || '10s' }}" \
             --timeout="${{ inputs.timeout || '2s' }}" \
             --http-native-runtime="bun" \
-            --output-dir="bench/results/bun"
+            --output-dir=".github/bench/results/bun"
 
       - name: Run benchmarks (http-native on Node)
         run: |
-          bun bench/ci.js \
+          bun .github/bench/ci.js \
             --engines="http-native" \
             --scenarios="${{ inputs.scenarios || 'static,dynamic,opt' }}" \
             --connections="${{ inputs.connections || '200' }}" \
             --duration="${{ inputs.duration || '10s' }}" \
             --timeout="${{ inputs.timeout || '2s' }}" \
             --http-native-runtime="node" \
-            --output-dir="bench/results/node"
+            --output-dir=".github/bench/results/node"
 
       - name: Display results
         if: always()
         run: |
           echo "=== Bun Runtime Results ==="
-          cat bench/results/bun/summary.md 2>/dev/null || echo "No Bun results"
+          cat .github/bench/results/bun/summary.md 2>/dev/null || echo "No Bun results"
           echo ""
           echo "=== Node Runtime Results ==="
-          cat bench/results/node/summary.md 2>/dev/null || echo "No Node results"
+          cat .github/bench/results/node/summary.md 2>/dev/null || echo "No Node results"
 
       - name: Upload benchmark artifacts
         if: always()
@@ -144,8 +143,8 @@ jobs:
         with:
           name: benchmark-results
           path: |
-            bench/results/bun/results.json
-            bench/results/bun/summary.md
-            bench/results/node/results.json
-            bench/results/node/summary.md
+            .github/bench/results/bun/results.json
+            .github/bench/results/bun/summary.md
+            .github/bench/results/node/results.json
+            .github/bench/results/node/summary.md
           if-no-files-found: ignore

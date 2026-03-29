@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
 process.env.HTTP_NATIVE_NATIVE_PATH ??= process.env.HTTP_NATIVE_NODE_PATH;
 
-const { createApp: createHttpNativeApp } = await import("../src/index.js");
+const { createApp: createHttpNativeApp } = await import("../../src/index.js");
 
 const [, , engine, scenario, portArg] = process.argv;
 const port = Number(portArg ?? 0);
@@ -160,7 +160,7 @@ if (engine === "bun") {
 } else if (engine === "http-native") {
   await startFrameworkServer(createHttpNativeApp, "http-native", scenario);
 } else if (engine === "old") {
-  const { createApp: createOldApp } = await import("../old/src/index.js");
+  const { createApp: createOldApp } = await import("../../old/src/index.js");
   await startFrameworkServer(createOldApp, "old", scenario);
 } else {
   throw new Error(`Unsupported benchmark engine: ${engine}`);

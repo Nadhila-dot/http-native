@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import net from "node:net";
 
-import httpServerConfig from "../src/http-server.config.js";
-import { createApp } from "../src/index.js";
+import httpServerConfig from "../../src/http-server.config.js";
+import { createApp } from "../../src/index.js";
 
 const stablePayload = {
   ok: true,

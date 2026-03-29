@@ -13,6 +13,7 @@ import {
   mergeRequestAccessPlans,
   releaseRequestObject,
 } from "./bridge.js";
+import { encodeSessionTrailer } from "./session.js";
 import { loadNativeModule } from "./native.js";
 import defaultHttpServerConfig, {
   normalizeHttpServerConfig,
@@ -571,7 +572,14 @@ function createDispatcher(
       ? performance.now() - dispatchStartMs
       : undefined;
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot, dispatchDurationMs);
-    const encoded = encodeResponseEnvelope(responseSnapshot);
+    let encoded = encodeResponseEnvelope(responseSnapshot);
+
+    // Append session trailer if session mutations exist
+    const sessionTrailer = encodeSessionTrailer(res._sessionState);
+    if (sessionTrailer) {
+      encoded = Buffer.concat([encoded, sessionTrailer]);
+    }
+
     maybePromoteRouteResponseCache(
       route,
       responseSnapshot,
@@ -1053,8 +1061,26 @@ export function createApp() {
                   }),
                 }
               : null,
+            needsSession: /\breq\.session\b|\breq\.sessionId\b/.test(route.handlerSource),
           })),
         };
+
+        // Detect session middleware and add config to manifest
+        const sessionMiddleware = this._middlewares.find((mw) => mw.handler._sessionConfig);
+        if (sessionMiddleware) {
+          const cfg = sessionMiddleware.handler._sessionConfig;
+          manifest.session = {
+            secret: cfg.secret,
+            maxAgeSecs: cfg.maxAge,
+            cookieName: cfg.cookieName,
+            httpOnly: cfg.httpOnly,
+            secure: cfg.secure,
+            sameSite: cfg.sameSite,
+            path: cfg.path,
+            maxSessions: cfg.maxSessions,
+            maxDataSize: cfg.maxDataSize,
+          };
+        }
 
         const runtimeOptimizer = createRuntimeOptimizer(
           compiledRoutes,

@@ -38,6 +38,49 @@ export interface Request {
 
   /** Get the request body as an ArrayBuffer */
   arrayBuffer(): ArrayBuffer;
+
+  /** Session object (available when session middleware is used) */
+  session: Session;
+
+  /** Current session ID (available when session middleware is used) */
+  readonly sessionId?: string;
+}
+
+export interface Session {
+  /** Get a session value by key */
+  get<T = unknown>(key: string): T | undefined;
+
+  /** Set a session value */
+  set(key: string, value: unknown): void;
+
+  /** Delete a session key */
+  delete(key: string): void;
+
+  /** Check if a key exists */
+  has(key: string): boolean;
+
+  /** Destroy the entire session */
+  destroy(): void;
+
+  /** Whether the session has been destroyed */
+  readonly isDestroyed: boolean;
+}
+
+export interface SessionOptions {
+  /** HMAC signing secret (required) */
+  secret: string;
+  /** Session TTL in seconds (default 3600) */
+  maxAge?: number;
+  /** Cookie name (default "sid") */
+  cookieName?: string;
+  /** HttpOnly flag (default true) */
+  httpOnly?: boolean;
+  /** Secure flag (default false) */
+  secure?: boolean;
+  /** SameSite policy (default "lax") */
+  sameSite?: "strict" | "lax" | "none";
+  /** Cookie path (default "/") */
+  path?: string;
 }
 
 export interface Response {

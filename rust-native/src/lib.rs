@@ -1,6 +1,7 @@
 mod analyzer;
 mod manifest;
 mod router;
+pub mod session;
 
 use anyhow::{anyhow, Context, Result};
 use memchr::memmem;
@@ -233,6 +234,101 @@ impl NativeServerHandle {
     }
 }
 
+// ─── Global Session Store ──────────────
+//
+// Accessible from both the server threads and direct NAPI calls from JS.
+// Initialized during start_server when session config is present.
+
+static GLOBAL_SESSION_STORE: std::sync::OnceLock<Arc<session::SessionStore>> =
+    std::sync::OnceLock::new();
+
+/// Get a session value by key. Returns JSON string or null.
+#[napi]
+pub fn session_get(session_id_hex: String, key: String) -> Option<String> {
+    let store = GLOBAL_SESSION_STORE.get()?;
+    let id = session::hex_decode_id(&session_id_hex)?;
+    let entry = store.get(&id)?;
+    let value = entry.data.get(&key)?;
+    String::from_utf8(value.clone()).ok()
+}
+
+/// Set a session value. Value should be a JSON string.
+#[napi]
+pub fn session_set(session_id_hex: String, key: String, value: String) -> bool {
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
+    let mut mutations = std::collections::HashMap::new();
+    mutations.insert(key, value.into_bytes());
+    store.upsert(&id, mutations, &[]);
+    true
+}
+
+/// Delete a session key.
+#[napi]
+pub fn session_delete(session_id_hex: String, key: String) -> bool {
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
+    store.upsert(&id, std::collections::HashMap::new(), &[key]);
+    true
+}
+
+/// Destroy an entire session.
+#[napi]
+pub fn session_destroy(session_id_hex: String) -> bool {
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
+    store.destroy(&id);
+    true
+}
+
+/// Verify a signed session cookie. Returns the session ID hex if valid, null otherwise.
+#[napi]
+pub fn session_verify_cookie(cookie_value: String) -> Option<String> {
+    let store = GLOBAL_SESSION_STORE.get()?;
+    let id = store.verify_cookie(&cookie_value)?;
+    Some(session::hex_encode_id(&id))
+}
+
+/// Generate a new signed session cookie value. Returns "hex_id.hex_hmac".
+#[napi]
+pub fn session_new_cookie() -> Option<String> {
+    let store = GLOBAL_SESSION_STORE.get()?;
+    let id = store.generate_id();
+    Some(store.build_cookie_value(&id))
+}
+
+/// Get all session data as a JSON object string.
+#[napi]
+pub fn session_get_all(session_id_hex: String) -> Option<String> {
+    let store = GLOBAL_SESSION_STORE.get()?;
+    let id = session::hex_decode_id(&session_id_hex)?;
+    let entry = store.get(&id)?;
+    let mut map = serde_json::Map::new();
+    for (key, value) in &entry.data {
+        if let Ok(json_val) = serde_json::from_slice(value) {
+            map.insert(key.clone(), json_val);
+        } else if let Ok(s) = std::str::from_utf8(value) {
+            map.insert(key.clone(), serde_json::Value::String(s.to_string()));
+        }
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+}
+
+/// Set multiple session values at once. Takes a JSON object string.
+#[napi]
+pub fn session_set_all(session_id_hex: String, data_json: String) -> bool {
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&data_json) else { return false };
+    let Some(map) = obj.as_object() else { return false };
+    let mut mutations = std::collections::HashMap::new();
+    for (key, value) in map {
+        mutations.insert(key.clone(), value.to_string().into_bytes());
+    }
+    store.upsert(&id, mutations, &[]);
+    true
+}
+
 #[napi]
 pub fn start_server(
     manifest_json: String,
@@ -244,6 +340,24 @@ pub fn start_server(
     let server_config =
         Arc::new(HttpServerConfig::from_manifest(&manifest).map_err(to_napi_error)?);
     let router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+
+    // Build session store if session config is present in manifest
+    let session_store: Option<Arc<session::SessionStore>> = manifest.session.as_ref().map(|cfg| {
+        let store = Arc::new(session::SessionStore::new(session::SessionConfig {
+            secret: cfg.secret.as_bytes().to_vec(),
+            max_age_secs: cfg.max_age_secs,
+            cookie_name: cfg.cookie_name.clone(),
+            http_only: cfg.http_only,
+            secure: cfg.secure,
+            same_site: session::SameSite::from_str(&cfg.same_site),
+            path: cfg.path.clone(),
+            max_sessions: cfg.max_sessions,
+            max_data_size: cfg.max_data_size,
+        }));
+        // Register globally so NAPI functions can access it
+        let _ = GLOBAL_SESSION_STORE.set(Arc::clone(&store));
+        store
+    });
 
     let callback: DispatchTsfn = dispatcher
         .build_threadsafe_function::<Buffer>()
@@ -264,6 +378,7 @@ pub fn start_server(
         let thread_dispatcher = Arc::clone(&dispatcher);
         let thread_config = Arc::clone(&server_config);
         let thread_shutdown = Arc::clone(&shutdown_flag);
+        let thread_session_store = session_store.clone();
         let thread_options = NativeListenOptions {
             host: options.host.clone(),
             port: options.port,
@@ -290,6 +405,7 @@ pub fn start_server(
                         thread_dispatcher,
                         thread_config,
                         thread_shutdown,
+                        thread_session_store,
                     )
                     .await
                 })
@@ -400,6 +516,7 @@ async fn run_server(
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
     shutdown_flag: Arc<AtomicBool>,
+    session_store: Option<Arc<session::SessionStore>>,
 ) -> Result<()> {
     let active_connections: std::cell::Cell<usize> = std::cell::Cell::new(0);
 
@@ -427,6 +544,7 @@ async fn run_server(
                 let router = Arc::clone(&router);
                 let dispatcher = Arc::clone(&dispatcher);
                 let server_config = Arc::clone(&server_config);
+                let session_store = session_store.clone();
                 active_connections.set(active_connections.get() + 1);
 
                 // Safety: monoio is single-threaded per worker, so Cell is fine here
@@ -434,7 +552,7 @@ async fn run_server(
 
                 monoio::spawn(async move {
                     if let Err(error) =
-                        handle_connection(stream, router, dispatcher, server_config).await
+                        handle_connection(stream, router, dispatcher, server_config, session_store).await
                     {
                         eprintln!("[http-native] connection error: {error}");
                     }
@@ -471,6 +589,8 @@ struct ParsedRequest<'a> {
     has_chunked_te: bool,
     /// Pre-parsed header pairs — stored once, used by both routing and bridge
     headers: Vec<(&'a str, &'a str)>,
+    /// Raw cookie header value for session extraction
+    cookie_header: Option<&'a str>,
 }
 
 use monoio::time::timeout;
@@ -488,6 +608,7 @@ async fn handle_connection(
     router: Arc<Router>,
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
+    session_store: Option<Arc<session::SessionStore>>,
 ) -> Result<()> {
     let mut buffer = acquire_buffer();
 
@@ -497,6 +618,7 @@ async fn handle_connection(
         &router,
         &dispatcher,
         &server_config,
+        session_store.as_deref(),
     )
     .await;
 
@@ -510,6 +632,7 @@ async fn handle_connection_inner(
     router: &Router,
     dispatcher: &JsDispatcher,
     server_config: &HttpServerConfig,
+    session_store: Option<&session::SessionStore>,
 ) -> Result<()> {
     let mut is_first_request = true;
 
@@ -630,12 +753,16 @@ async fn handle_connection_inner(
         // String/Vec allocations for method, target, path, and headers.
         if !has_body {
             let dispatch_decision = build_dispatch_decision_zero_copy(router, &parsed, &[])?;
+
+            // Extract session before dropping parsed
+            let (session_id, is_new_session) = resolve_session(session_store, parsed.cookie_header);
+
             drop(parsed);
             drain_consumed_bytes(buffer, header_bytes);
 
             match dispatch_decision {
                 DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, url_bytes) => {
-                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, &url_bytes)
+                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, &url_bytes, session_store, session_id, is_new_session)
                         .await?;
                 }
                 DispatchDecision::SpecializedResponse(response) => {
@@ -668,6 +795,7 @@ async fn handle_connection_inner(
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect();
+        let (session_id_body, is_new_session_body) = resolve_session(session_store, parsed.cookie_header);
         drop(parsed);
 
         // ── Read request body 
@@ -744,7 +872,7 @@ async fn handle_connection_inner(
 
         match dispatch_decision_owned {
             DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, url_bytes) => {
-                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, &url_bytes).await?;
+                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, &url_bytes, session_store, session_id_body, is_new_session_body).await?;
             }
             DispatchDecision::SpecializedResponse(response) => {
                 let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
@@ -799,6 +927,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
     let mut has_body = false;
     let mut content_length: Option<usize> = None;
     let mut has_chunked_te = false;
+    let mut cookie_header: Option<&str> = None;
     let mut headers = Vec::with_capacity(req.headers.len());
 
     for header in req.headers.iter() {
@@ -847,6 +976,11 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
             }
         }
 
+        // Session: capture cookie header for session extraction
+        if name.eq_ignore_ascii_case("cookie") {
+            cookie_header = Some(value);
+        }
+
         headers.push((name, value));
     }
 
@@ -860,6 +994,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
         content_length,
         has_chunked_te,
         headers,
+        cookie_header,
     })
 }
 
@@ -937,6 +1072,7 @@ fn parse_hot_root_request(
         content_length: None,
         has_chunked_te: false,
         headers: Vec::new(),
+        cookie_header: None, // Hot path doesn't parse cookies
     })
 }
 
@@ -1093,6 +1229,7 @@ fn build_dispatch_decision_owned(
              content_length: None,
              has_chunked_te: false,
              headers: header_refs.clone(),
+             cookie_header: None,
          };
          let key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
          cache_insertion = Some((matched_route.handler_id, key, cfg.max_entries, cfg.ttl_secs));
@@ -1747,6 +1884,115 @@ fn compute_ncache_key(handler_id: u32, url_bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+// ─── Session Trailer Extraction ────────
+//
+// Extracts session write instructions from the response envelope trailer.
+// Magic: 0x5E 0x57 | action(1) | entry_count(2) | deleted_count(2) | entries... | deleted_keys...
+
+struct SessionWriteTrailer {
+    action: session::SessionAction,
+    mutations: std::collections::HashMap<String, Vec<u8>>,
+    deleted_keys: Vec<String>,
+}
+
+/// Find the body end offset in a response envelope (skip fixed header + all headers + body).
+fn response_body_end_offset(dispatch_bytes: &[u8]) -> Option<usize> {
+    if dispatch_bytes.len() < 8 {
+        return None;
+    }
+    let mut offset = 0usize;
+    let _status = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+    offset += 2;
+    let header_count = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+    offset += 2;
+    let body_length = (dispatch_bytes[offset] as u32)
+        | ((dispatch_bytes[offset + 1] as u32) << 8)
+        | ((dispatch_bytes[offset + 2] as u32) << 16)
+        | ((dispatch_bytes[offset + 3] as u32) << 24);
+    offset += 4;
+
+    // Skip headers
+    for _ in 0..header_count {
+        if offset + 3 > dispatch_bytes.len() { return None; }
+        let name_len = dispatch_bytes[offset] as usize;
+        offset += 1;
+        let value_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+        offset += 2;
+        offset += name_len + value_len as usize;
+    }
+
+    // Skip body
+    offset += body_length as usize;
+    Some(offset)
+}
+
+/// Extract session write trailer from the response envelope.
+/// Called after the ncache trailer position. Scans from `start_offset`.
+fn extract_session_trailer(dispatch_bytes: &[u8], start_offset: usize) -> Option<SessionWriteTrailer> {
+    let mut offset = start_offset;
+
+    // Check for session magic (0x5E 0x57)
+    if offset + 7 > dispatch_bytes.len() {
+        return None;
+    }
+    if dispatch_bytes[offset] != 0x5E || dispatch_bytes[offset + 1] != 0x57 {
+        return None;
+    }
+    offset += 2;
+
+    let action_byte = dispatch_bytes[offset];
+    offset += 1;
+    let action = session::SessionAction::from_byte(action_byte)?;
+
+    let entry_count = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+    offset += 2;
+
+    let deleted_count = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+    offset += 2;
+
+    let mut mutations = std::collections::HashMap::new();
+    for _ in 0..entry_count {
+        if offset + 2 > dispatch_bytes.len() { return None; }
+        let key_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+        offset += 2;
+        let key_len = key_len as usize;
+        if offset + key_len > dispatch_bytes.len() { return None; }
+        let key = std::str::from_utf8(&dispatch_bytes[offset..offset + key_len]).ok()?;
+        offset += key_len;
+
+        if offset + 4 > dispatch_bytes.len() { return None; }
+        let value_len = (dispatch_bytes[offset] as u32)
+            | ((dispatch_bytes[offset + 1] as u32) << 8)
+            | ((dispatch_bytes[offset + 2] as u32) << 16)
+            | ((dispatch_bytes[offset + 3] as u32) << 24);
+        offset += 4;
+        let value_len = value_len as usize;
+        if offset + value_len > dispatch_bytes.len() { return None; }
+        let value = dispatch_bytes[offset..offset + value_len].to_vec();
+        offset += value_len;
+
+        mutations.insert(key.to_string(), value);
+    }
+
+    let mut deleted_keys = Vec::new();
+    for _ in 0..deleted_count {
+        if offset + 2 > dispatch_bytes.len() { return None; }
+        let key_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+        offset += 2;
+        let key_len = key_len as usize;
+        if offset + key_len > dispatch_bytes.len() { return None; }
+        let key = std::str::from_utf8(&dispatch_bytes[offset..offset + key_len]).ok()?;
+        offset += key_len;
+        deleted_keys.push(key.to_string());
+    }
+
+    Some(SessionWriteTrailer {
+        action,
+        mutations,
+        deleted_keys,
+    })
+}
+
 async fn write_dynamic_dispatch_response(
     stream: &mut TcpStream,
     dispatcher: &JsDispatcher,
@@ -1755,11 +2001,14 @@ async fn write_dynamic_dispatch_response(
     cache_insertion: Option<(u32, u64, usize, u64)>,
     handler_id: u32,
     url_bytes: &[u8],
+    session_store: Option<&session::SessionStore>,
+    session_id: Option<[u8; session::SESSION_ID_BYTES]>,
+    is_new_session: bool,
 ) -> Result<()> {
     match dispatcher.dispatch(request).await {
         Ok(response) => {
             match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
-                Ok(http_response) => {
+                Ok(mut http_response) => {
                     if let Some((handler_id, cache_key, max_entries, ttl_secs)) = cache_insertion {
                         // Route-level cache insertion (takes precedence over ncache)
                         let response_bytes_close: bytes::Bytes = if !keep_alive {
@@ -1808,6 +2057,63 @@ async fn write_dynamic_dispatch_response(
                                     response_bytes_close,
                                     expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ncache_ttl),
                                 }, ncache_max_entries);
+                            }
+                        }
+                    }
+
+                    // Process session trailer if session store is active
+                    if let Some(store) = session_store {
+                        if let Some(body_end) = response_body_end_offset(response.as_ref()) {
+                            // Skip past ncache trailer (10 bytes) if present
+                            let mut session_scan_offset = body_end;
+                            if session_scan_offset + 10 <= response.as_ref().len()
+                                && response.as_ref()[session_scan_offset] == 0xCA
+                                && response.as_ref()[session_scan_offset + 1] == 0xCE
+                            {
+                                session_scan_offset += 10;
+                            }
+
+                            if let Some(trailer) = extract_session_trailer(response.as_ref(), session_scan_offset) {
+                                match trailer.action {
+                                    session::SessionAction::Update => {
+                                        if let Some(sid) = session_id {
+                                            store.upsert(&sid, trailer.mutations, &trailer.deleted_keys);
+                                            // Inject Set-Cookie for new sessions
+                                            if is_new_session {
+                                                let cookie = store.build_set_cookie(&sid);
+                                                inject_set_cookie_header(&mut http_response, &cookie);
+                                            }
+                                        }
+                                    }
+                                    session::SessionAction::Destroy => {
+                                        if let Some(sid) = session_id {
+                                            store.destroy(&sid);
+                                            let cookie = store.build_destroy_cookie();
+                                            inject_set_cookie_header(&mut http_response, &cookie);
+                                        }
+                                    }
+                                    session::SessionAction::Regenerate => {
+                                        // Destroy old, create new
+                                        if let Some(old_sid) = session_id {
+                                            let old_data = store.get(&old_sid);
+                                            store.destroy(&old_sid);
+                                            let new_sid = store.generate_id();
+                                            if let Some(entry) = old_data {
+                                                store.upsert(&new_sid, entry.data, &[]);
+                                            }
+                                            store.upsert(&new_sid, trailer.mutations, &trailer.deleted_keys);
+                                            let cookie = store.build_set_cookie(&new_sid);
+                                            inject_set_cookie_header(&mut http_response, &cookie);
+                                        }
+                                    }
+                                }
+                            } else if is_new_session {
+                                // No session trailer but session was accessed — set cookie
+                                if let Some(sid) = session_id {
+                                    store.upsert(&sid, std::collections::HashMap::new(), &[]);
+                                    let cookie = store.build_set_cookie(&sid);
+                                    inject_set_cookie_header(&mut http_response, &cookie);
+                                }
                             }
                         }
                     }
@@ -1919,6 +2225,45 @@ fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) ->
     output.extend_from_slice(&dispatch_bytes[offset..offset + body_length]);
 
     Ok(output)
+}
+
+/// Resolve the session ID from the cookie header. Returns (session_id, is_new).
+/// If no cookie is present or invalid, generates a new session ID.
+fn resolve_session(
+    session_store: Option<&session::SessionStore>,
+    cookie_header: Option<&str>,
+) -> (Option<[u8; session::SESSION_ID_BYTES]>, bool) {
+    let Some(store) = session_store else {
+        return (None, false);
+    };
+
+    if let Some(cookie_value) = cookie_header.and_then(|h| store.extract_cookie_value(h)) {
+        if let Some(id) = store.verify_cookie(cookie_value) {
+            // Valid existing session
+            return (Some(id), false);
+        }
+    }
+
+    // No valid session cookie — generate a new session ID
+    let new_id = store.generate_id();
+    (Some(new_id), true)
+}
+
+/// Inject a Set-Cookie header into an already-built HTTP response.
+/// Inserts the header just before the final \r\n\r\n (end of headers).
+fn inject_set_cookie_header(response: &mut Vec<u8>, cookie_value: &str) {
+    // Find the \r\n\r\n boundary between headers and body
+    if let Some(pos) = memmem::find(response, b"\r\n\r\n") {
+        let header_line = format!("set-cookie: {}\r\n", cookie_value);
+        let header_bytes = header_line.as_bytes();
+
+        // Insert before the final \r\n\r\n
+        let insert_pos = pos + 2; // after the last header's \r\n, before the blank \r\n
+        response.splice(insert_pos..insert_pos, header_bytes.iter().copied());
+
+        // Update Content-Length — it shouldn't change since we're adding headers, not body.
+        // Content-Length only measures the body, which is unchanged.
+    }
 }
 
 /// Build a simple error response without going through the JS bridge

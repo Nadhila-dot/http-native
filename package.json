@@ -9,6 +9,7 @@
       "default": "./src/index.js"
     },
     "./cors": "./src/cors.js",
+    "./session": "./src/session.js",
     "./validate": "./src/validate.js",
     "./http-server.config": "./src/http-server.config.js"
   },

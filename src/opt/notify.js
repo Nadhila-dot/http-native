@@ -3,7 +3,7 @@ const ANSI = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
   dim: "\x1b[2m",
-  
+
   // Foreground colors
   black: "\x1b[30m",
   red: "\x1b[31m",
@@ -16,12 +16,18 @@ const ANSI = {
   gray: "\x1b[90m",
   
   // Background colors
+  bgBlack: "\x1b[40m",
   bgRed: "\x1b[41m",
   bgGreen: "\x1b[42m",
   bgYellow: "\x1b[43m",
   bgBlue: "\x1b[44m",
   bgMagenta: "\x1b[45m",
   bgCyan: "\x1b[46m",
+};
+
+const ANSI_256 = {
+  fg: (code) => `\x1b[38;5;${code}m`,
+  bg: (code) => `\x1b[48;5;${code}m`,
 };
 
 // Log level styles mimicking cat-loggr
@@ -50,10 +56,12 @@ function getTimestamp() {
 function formatLog(level, message) {
   const style = LOG_LEVELS[level] || LOG_LEVELS.info;
   const timestamp = getTimestamp();
-  const badge = `${style.bg}${style.fg} ${pad(style.label.length)} ${style.label} ${style.label.length === 5 ? "" : " "}${ANSI.reset}`;
-  const spacer = `${ANSI.dim}${ANSI.gray}|${ANSI.reset}`;
-  
-  return `  ${ANSI.dim}${timestamp}${ANSI.reset}  ${badge}  ${message}`;
+
+  const timestampBadge = `${ANSI_256.bg(229)}${ANSI_256.fg(238)} ${timestamp} ${ANSI.reset}`;
+  const levelBadge = `${style.bg}${style.fg} ${style.label.padEnd(7, " ")} ${ANSI.reset}`;
+  const separator = `${ANSI.dim}${ANSI_256.fg(245)}||${ANSI.reset}`;
+
+  return `${timestampBadge}${levelBadge} ${separator} ${message}`;
 }
 
 function log(level, message) {
@@ -119,7 +127,7 @@ function printRouteCatalog(routeEntries) {
     return;
   }
 
-  log("info", "tracking routes:");
+  log("info", "Route information / Tracking:");
   for (const entry of routeEntries) {
     log("debug", `${ANSI.magenta}${entry.label}${ANSI.reset} staticFastPath=${entry.staticFastPath} dispatch=${entry.dispatchKind}`);
   }
@@ -132,11 +140,27 @@ function printLiveRouteHits(routeEntries) {
     return;
   }
 
-  log("info", "live hits:");
-  for (const entry of active) {
+  // this is not needed just makes things ugly
+  //log("info", "Router & Routes:");
+  for (const entry of active.sort((a, b) => b.hits - a.hits)) {
+    const intervalHits = entry.hits - entry.lastIntervalHits;
+    const intervalDurationMs = entry.totalDurationMs - entry.lastIntervalDurationMs;
+    const avgMs = entry.hits > 0 ? entry.totalDurationMs / entry.hits : 0;
+    const intervalAvgMs =
+      intervalHits > 0 ? intervalDurationMs / intervalHits : 0;
+
     log(
       "success",
-      `${ANSI.magenta}${entry.label}${ANSI.reset} ${ANSI.green}hits=${entry.hits}${ANSI.reset} stage=${entry.stage} bridgeObserved=${entry.bridgeObserved}`,
+      `${ANSI.magenta}${entry.label}${ANSI.reset} total=${entry.hits} +${intervalHits} avg=${formatMs(avgMs)} last=${formatMs(entry.lastDurationMs)} max=${formatMs(entry.maxDurationMs)} intervalAvg=${formatMs(intervalAvgMs)}`,
     );
+    entry.lastIntervalHits = entry.hits;
+    entry.lastIntervalDurationMs = entry.totalDurationMs;
   }
+}
+
+function formatMs(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0.00ms";
+  }
+  return `${value.toFixed(2)}ms`;
 }

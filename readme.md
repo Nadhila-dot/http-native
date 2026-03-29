@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://cf-data.pkg.lat/httpnative-banner.png" alt="Http-native banner" width="720" />
+ <img src="https://cf-data.pkg.lat/httpnative-banner.png" style="width: 600px; height: 450px; object-fit: cover;" />
 </p>
 
 

@@ -158,6 +158,7 @@ function acquireResponseState() {
     pooled.body = EMPTY_BUFFER;
     pooled.finished = false;
     pooled.locals = Object.create(null);
+    pooled.ncache = null;
     return pooled;
   }
 
@@ -167,6 +168,7 @@ function acquireResponseState() {
     body: EMPTY_BUFFER,
     finished: false,
     locals: Object.create(null),
+    ncache: null,
   };
 }
 
@@ -277,6 +279,37 @@ const RESPONSE_PROTO = {
     }
     return this.send(String(code));
   },
+
+  /**
+   * Send a JSON response and cache it in the Rust native layer so that
+   * subsequent requests are served directly from Rust without crossing
+   * the JS bridge.
+   *
+   * @param {*}      data                 - JSON-serializable response data
+   * @param {number} ttl                  - Cache TTL in seconds
+   * @param {Object} [options]
+   * @param {number} [options.maxEntries] - Max LRU entries per route (default 256)
+   * @returns {this}
+   */
+  ncache(data, ttl, options = {}) {
+    const state = this._state;
+    if (state.finished) {
+      return this;
+    }
+
+    const ttlSecs = Math.max(1, Math.floor(Number(ttl) || 60));
+    const maxEntries = Math.max(1, Math.floor(Number(options.maxEntries) || 256));
+
+    if (!state.headers["content-type"]) {
+      state.headers["content-type"] = "application/json; charset=utf-8";
+    }
+
+    state.body = this._jsonSerializer(data);
+    state.finished = true;
+    state.ncache = { ttl: ttlSecs, maxEntries };
+
+    return this;
+  },
 };
 
 function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
@@ -293,6 +326,7 @@ function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
         status: state.status,
         headers: state.headers,
         body: state.body,
+        ncache: state.ncache,
       };
     },
     release() {
@@ -447,6 +481,8 @@ function createDispatcher(
 ) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
   const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
+  const trackDispatchTiming =
+    runtimeOptimizer?.shouldCaptureDispatchTiming?.() === true;
 
   async function finalizeError(error, req, res, snapshot, release, fallbackStatus = 500) {
     try {
@@ -511,6 +547,7 @@ function createDispatcher(
 
     const req = route.requestFactory(decoded);
     const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
+    const dispatchStartMs = trackDispatchTiming ? performance.now() : 0;
 
     try {
       const middlewareResult = route.runMiddlewares(req, res);
@@ -530,7 +567,10 @@ function createDispatcher(
     }
 
     const responseSnapshot = snapshot();
-    runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
+    const dispatchDurationMs = trackDispatchTiming
+      ? performance.now() - dispatchStartMs
+      : undefined;
+    runtimeOptimizer?.recordDispatch(route, req, responseSnapshot, dispatchDurationMs);
     const encoded = encodeResponseEnvelope(responseSnapshot);
     maybePromoteRouteResponseCache(
       route,

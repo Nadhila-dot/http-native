@@ -20,7 +20,8 @@ export function summarizeRouteEntries(routeEntries) {
         flags.push(entry.recommendation);
       }
       const uniqueFlags = [...new Set(flags)];
-      return `${entry.label} [${uniqueFlags.join(", ")}] hits=${entry.hits}`;
+      const avgMs = entry.hits > 0 ? entry.totalDurationMs / entry.hits : 0;
+      return `${entry.label} [${uniqueFlags.join(", ")}] hits=${entry.hits} avg=${avgMs.toFixed(3)}ms max=${entry.maxDurationMs.toFixed(3)}ms`;
     })
     .join("\n");
 }
@@ -43,6 +44,10 @@ export function snapshotRouteEntries(routeEntries) {
       recommendation: entry.recommendation,
       reasons: [...entry.reasons],
       lastHitAt: entry.lastHitAt,
+      avgDurationMs:
+        entry.hits > 0 ? entry.totalDurationMs / entry.hits : 0,
+      lastDurationMs: entry.lastDurationMs,
+      maxDurationMs: entry.maxDurationMs,
     })),
   };
 }

@@ -29,6 +29,7 @@ on:
         description: "Bombardier timeout"
         required: false
         default: "2s"
+
 jobs:
   benchmark:
     runs-on: ubuntu-latest
@@ -48,29 +49,72 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
+
+      - name: Ensure cc linker is available
+        run: |
+          if command -v cc >/dev/null 2>&1; then
+            echo "cc already available: $(command -v cc)"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-native/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-native/Cargo.lock', 'rust-native/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build Rust native module
+        working-directory: rust-native
+        run: |
+          cargo build --release
+          echo "Rust native module built successfully"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "stable"
+          cache: true
 
       - name: Install bombardier
         run: |
           go install github.com/codesenberg/bombardier@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify tools
+        run: |
+          echo "--- Versions ---"
+          bun --version
+          node --version
+          rustc --version
+          bombardier --version || bombardier -v || echo "bombardier installed"
+          echo "--- Ready ---"
+
+      - name: Create output directories
+        run: |
+          mkdir -p bench/results/bun
+          mkdir -p bench/results/node
 
       - name: Run benchmarks (http-native on Bun + selected engines)
         run: |
           bun bench/ci.js \
-            --engines="${{ github.event.inputs.engines || 'http-native,bun' }}" \
-            --scenarios="${{ github.event.inputs.scenarios || 'static,dynamic,opt' }}" \
-            --connections="${{ github.event.inputs.connections || '200' }}" \
-            --duration="${{ github.event.inputs.duration || '10s' }}" \
-            --timeout="${{ github.event.inputs.timeout || '2s' }}" \
+            --engines="${{ inputs.engines || 'http-native,bun' }}" \
+            --scenarios="${{ inputs.scenarios || 'static,dynamic,opt' }}" \
+            --connections="${{ inputs.connections || '200' }}" \
+            --duration="${{ inputs.duration || '10s' }}" \
+            --timeout="${{ inputs.timeout || '2s' }}" \
             --http-native-runtime="bun" \
             --output-dir="bench/results/bun"
 
@@ -78,12 +122,21 @@ jobs:
         run: |
           bun bench/ci.js \
             --engines="http-native" \
-            --scenarios="${{ github.event.inputs.scenarios || 'static,dynamic,opt' }}" \
-            --connections="${{ github.event.inputs.connections || '200' }}" \
-            --duration="${{ github.event.inputs.duration || '10s' }}" \
-            --timeout="${{ github.event.inputs.timeout || '2s' }}" \
+            --scenarios="${{ inputs.scenarios || 'static,dynamic,opt' }}" \
+            --connections="${{ inputs.connections || '200' }}" \
+            --duration="${{ inputs.duration || '10s' }}" \
+            --timeout="${{ inputs.timeout || '2s' }}" \
             --http-native-runtime="node" \
             --output-dir="bench/results/node"
+
+      - name: Display results
+        if: always()
+        run: |
+          echo "=== Bun Runtime Results ==="
+          cat bench/results/bun/summary.md 2>/dev/null || echo "No Bun results"
+          echo ""
+          echo "=== Node Runtime Results ==="
+          cat bench/results/node/summary.md 2>/dev/null || echo "No Node results"
 
       - name: Upload benchmark artifacts
         if: always()

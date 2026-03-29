@@ -49,6 +49,11 @@ export function buildRouteEntry(route, middlewares) {
     stableResponses: 0,
     lastResponseKey: null,
     settled: false,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+    lastDurationMs: 0,
+    lastIntervalHits: 0,
+    lastIntervalDurationMs: 0,
   };
 }
 

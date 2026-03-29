@@ -70,6 +70,16 @@ export interface Response {
 
   /** Set status and send status code as text body */
   sendStatus(code: number): Response;
+
+  /**
+   * Send a JSON response and cache it in the Rust native layer.
+   * Subsequent requests are served directly from Rust without crossing the JS bridge.
+   *
+   * @param data - JSON-serializable response data
+   * @param ttl  - Cache TTL in seconds
+   * @param options.maxEntries - Max LRU entries per route (default 256)
+   */
+  ncache(data: unknown, ttl: number, options?: { maxEntries?: number }): Response;
 }
 
 export type NextFunction = () => Promise<void>;
@@ -104,6 +114,8 @@ export interface RuntimeOptimizationOptions {
   notify?: boolean;
   /** Live notify interval in milliseconds (default: 1000) */
   notifyIntervalMs?: number;
+  /** Collect per-route dispatch timing metrics */
+  timing?: boolean;
   /** Enable runtime response cache promotion for deterministic routes */
   cache?: boolean;
   /** Write dev comments above route declarations with optimization flags (default: true) */
@@ -175,6 +187,9 @@ export interface RouteOptimizationInfo {
   bridgeObserved: boolean;
   cacheCandidate: boolean;
   hits: number;
+  avgDurationMs?: number;
+  lastDurationMs?: number;
+  maxDurationMs?: number;
   recommendation?: string;
   dispatchKind?: string;
   jsonFastPath?: string;

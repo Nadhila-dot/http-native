@@ -15,6 +15,10 @@ import { snapshotRouteEntries, summarizeRouteEntries } from "./summary.js";
 export function createRuntimeOptimizer(routes, middlewares, options = {}) {
   const notifyEnabled =
     options.notify === true || process.env.HTTP_NATIVE_OPT_NOTIFY === "1";
+  const timingEnabled =
+    notifyEnabled ||
+    options.timing === true ||
+    process.env.HTTP_NATIVE_OPT_TIMING === "1";
   const notifyIntervalMs = normalizeNotifyInterval(
     options.notifyIntervalMs,
     DEFAULT_NOTIFY_INTERVAL_MS,
@@ -32,7 +36,11 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
   notifier.printStartup();
 
   return {
-    recordDispatch(route, _request, snapshot) {
+    shouldCaptureDispatchTiming() {
+      return timingEnabled;
+    },
+
+    recordDispatch(route, _request, snapshot, durationMs) {
       const entry = routesByHandlerId.get(route.handlerId);
       if (!entry || entry.settled) {
         return;
@@ -41,6 +49,13 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
       entry.hits += 1;
       entry.bridgeObserved = true;
       notifier.markDirty();
+      if (Number.isFinite(durationMs) && durationMs >= 0) {
+        entry.lastDurationMs = durationMs;
+        entry.totalDurationMs += durationMs;
+        if (durationMs > entry.maxDurationMs) {
+          entry.maxDurationMs = durationMs;
+        }
+      }
 
       if (entry.stage === "cold") {
         if (entry.hits >= HOT_HIT_THRESHOLD) {

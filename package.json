@@ -1,9 +1,12 @@
 {
   "name": "@http-native/core",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "publishConfig": {
     "access": "public"
+  },
+  "bin": {
+    "http-native": "./src/cli.js"
   },
   "files": [
     "src"
@@ -47,5 +50,8 @@
     "bench:xitca:opt": "bun bench/run.js xitca opt 3023",
     "bench:monoio:opt": "bun bench/run.js monoio opt 3024",
     "bench:zig:opt": "bun bench/run.js zig opt 3025"
+  },
+  "dependencies": {
+    "@http-native/core": "^0.0.1"
   }
 }

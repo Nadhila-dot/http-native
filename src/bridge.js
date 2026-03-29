@@ -592,6 +592,15 @@ function getCachedHeaderNameBytes(name) {
   return bytes;
 }
 
+// Pre-encoded content-type header name + common values to skip textEncoder.encode() on hot path
+const CT_NAME_BYTES = textEncoder.encode("content-type");
+const PREENCODED_CT_VALUES = {
+  "application/json; charset=utf-8": textEncoder.encode("application/json; charset=utf-8"),
+  "text/plain; charset=utf-8": textEncoder.encode("text/plain; charset=utf-8"),
+  "text/html; charset=utf-8": textEncoder.encode("text/html; charset=utf-8"),
+  "application/octet-stream": textEncoder.encode("application/octet-stream"),
+};
+
 /**
  * Encode a JS response snapshot into the binary envelope that the Rust
  * layer can decode directly into HTTP/1.1 response bytes.
@@ -608,7 +617,6 @@ export function encodeResponseEnvelope(snapshot) {
       ? Buffer.from(snapshot.body)
       : Buffer.alloc(0);
 
-  // Encode headers inline — avoids Object.entries().map() intermediate arrays
   const ncache = snapshot.ncache || null;
   const headerKeys = rawHeaders ? Object.keys(rawHeaders) : EMPTY_ARRAY;
   const headerCount = headerKeys.length;
@@ -618,8 +626,19 @@ export function encodeResponseEnvelope(snapshot) {
 
   for (let i = 0; i < headerCount; i++) {
     const name = headerKeys[i];
-    const nameBytes = getCachedHeaderNameBytes(name);
-    const valueBytes = textEncoder.encode(String(rawHeaders[name]));
+    const rawValue = String(rawHeaders[name]);
+
+    // Fast path: use pre-encoded bytes for content-type
+    let nameBytes, valueBytes;
+    if (name === "content-type") {
+      nameBytes = CT_NAME_BYTES;
+      const preValue = PREENCODED_CT_VALUES[rawValue];
+      valueBytes = preValue || textEncoder.encode(rawValue);
+    } else {
+      nameBytes = getCachedHeaderNameBytes(name);
+      valueBytes = textEncoder.encode(rawValue);
+    }
+
     if (nameBytes.length > 0xff) {
       throw new Error(`Response header name too long: ${nameBytes.length}`);
     }

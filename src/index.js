@@ -551,9 +551,12 @@ function createDispatcher(
     const dispatchStartMs = trackDispatchTiming ? performance.now() : 0;
 
     try {
-      const middlewareResult = route.runMiddlewares(req, res);
-      if (!res.finished && isPromiseLike(middlewareResult)) {
-        await middlewareResult;
+      // Fast path: skip middleware runner entirely when no middlewares are attached
+      if (route._hasMiddlewares) {
+        const middlewareResult = route.runMiddlewares(req, res);
+        if (!res.finished && isPromiseLike(middlewareResult)) {
+          await middlewareResult;
+        }
       }
       if (!res.finished) {
         const handlerResult = route.compiledHandler(req, res);
@@ -823,6 +826,7 @@ function compileRouteDispatch(
     requestFactory,
     runMiddlewares,
     compiledHandler,
+    _hasMiddlewares: applicableMiddlewares.length > 0,
     dispatchKind: requestPlan.dispatchKind,
     jsonFastPath,
     jsonSerializer: createJsonSerializer(jsonFastPath),

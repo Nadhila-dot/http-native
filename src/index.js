@@ -1186,9 +1186,14 @@ export function createApp() {
           this._errorHandlers,
           devRouteCommentWriter,
         );
+        // Hot reload: override port/host if the hot reloader is active
+        const hotCtx = globalThis.__HTTP_NATIVE_HOT__;
+        const listenHost = hotCtx?.host ?? normalizedOptions.host;
+        const listenPort = hotCtx?.port ?? normalizedOptions.port;
+
         const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
-          host: normalizedOptions.host,
-          port: normalizedOptions.port,
+          host: listenHost,
+          port: listenPort,
           backlog: normalizedOptions.backlog,
         });
         ACTIVE_NATIVE_SERVERS.add(handle);
@@ -1215,7 +1220,7 @@ export function createApp() {
           },
         });
 
-        return {
+        const serverHandle = {
           host: handle.host,
           port: handle.port,
           url: normalizedOptions.tls ? handle.url.replace("http://", "https://") : handle.url,
@@ -1234,6 +1239,13 @@ export function createApp() {
             return closeServerHandle();
           },
         };
+
+        // Hot reload: capture the server handle so hot.js can manage it
+        if (hotCtx) {
+          hotCtx.server = serverHandle;
+        }
+
+        return serverHandle;
       };
 
       let selectedPort = options.port;

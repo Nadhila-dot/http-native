@@ -17,6 +17,7 @@
       "default": "./src/index.js"
     },
     "./cors": "./src/cors.js",
+    "./hot": "./src/hot.js",
     "./session": "./src/session.js",
     "./validate": "./src/validate.js",
     "./http-server.config": "./src/http-server.config.js"
@@ -25,6 +26,7 @@
     "build": "bun scripts/build-native.mjs",
     "build:release": "bun scripts/build-native.mjs --release",
     "dev:hot": "HTTP_NATIVE_HOT_RELOAD=1 bun test/app.ts",
+    "dev": "bun src/hot.js",
     "test": "bun run build && bun test/test.js",
     "bench": "bun run build:release && bun bench/run.js",
     "bench:http-native:static": "bun run build:release && bun bench/run.js http-native static 3001",

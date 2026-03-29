@@ -5,6 +5,9 @@
   "publishConfig": {
     "access": "public"
   },
+  "files": [
+    "src"
+  ],
   "exports": {
     ".": {
       "types": "./src/index.d.ts",

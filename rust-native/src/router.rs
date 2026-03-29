@@ -22,8 +22,10 @@ pub struct Router {
     dynamic_exact_routes: HashMap<MethodKey, HashMap<Box<[u8]>, DynamicRouteSpec>>,
     /// O(1) static-response routes
     exact_static_routes: HashMap<MethodKey, HashMap<Box<[u8]>, ExactStaticRoute>>,
-    /// O(M) radix-tree routes per method (M = path length)  
+    /// O(M) radix-tree routes per method (M = path length)
     radix_trees: HashMap<MethodKey, RadixNode>,
+    /// WebSocket routes: path → handler_id
+    ws_routes: HashMap<String, u32>,
 }
 
 #[derive(Clone)]
@@ -268,11 +270,18 @@ impl Router {
             }
         }
 
+        let mut ws_routes = HashMap::new();
+        for ws_route in &manifest.ws_routes {
+            let path = normalize_path(ws_route.path.as_str());
+            ws_routes.insert(path, ws_route.handler_id);
+        }
+
         Ok(Self {
             exact_get_root,
             dynamic_exact_routes,
             exact_static_routes,
             radix_trees,
+            ws_routes,
         })
     }
 
@@ -342,6 +351,10 @@ impl Router {
 
     pub fn exact_get_root(&self) -> Option<&ExactStaticRoute> {
         self.exact_get_root.as_ref()
+    }
+
+    pub fn match_ws_route(&self, path: &str) -> Option<u32> {
+        self.ws_routes.get(path).copied()
     }
 }
 

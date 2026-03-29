@@ -2,6 +2,7 @@ mod analyzer;
 mod manifest;
 mod router;
 pub mod session;
+mod websocket;
 
 use anyhow::{anyhow, Context, Result};
 use memchr::memmem;
@@ -18,7 +19,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::io::BufReader;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use url::form_urlencoded;
@@ -246,6 +247,57 @@ impl NativeServerHandle {
 
 static GLOBAL_SESSION_STORE: std::sync::OnceLock<Arc<session::SessionStore>> =
     std::sync::OnceLock::new();
+
+// ─── Global Stream Registry ──────────
+//
+// Streams are created on the monoio thread when a stream-start sentinel is
+// detected in the JS dispatch response.  The Sender lives in the DashMap so
+// that NAPI calls from JS (`stream_write`, `stream_end`) can push chunks.
+// The Receiver is held locally on the monoio thread that drives the chunked
+// transfer loop.
+
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+static STREAM_CHANNELS: std::sync::OnceLock<dashmap::DashMap<u64, flume::Sender<StreamMessage>>> =
+    std::sync::OnceLock::new();
+
+fn stream_registry() -> &'static dashmap::DashMap<u64, flume::Sender<StreamMessage>> {
+    STREAM_CHANNELS.get_or_init(dashmap::DashMap::new)
+}
+
+enum StreamMessage {
+    Chunk(Vec<u8>),
+    End,
+}
+
+/// Allocate the next stream ID. Called from JS before dispatching so the
+/// stream-start envelope can embed the ID.
+#[napi]
+pub fn stream_create() -> i64 {
+    NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed) as i64
+}
+
+/// Write a chunk to an active stream. Called from JS.
+#[napi]
+pub fn stream_write(stream_id: i64, chunk: Buffer) -> napi::Result<()> {
+    let registry = stream_registry();
+    let sender = registry
+        .get(&(stream_id as u64))
+        .ok_or_else(|| napi::Error::from_reason(format!("Stream {} not found", stream_id)))?;
+    sender
+        .send(StreamMessage::Chunk(chunk.to_vec()))
+        .map_err(|_| napi::Error::from_reason("Stream channel closed"))?;
+    Ok(())
+}
+
+/// End an active stream. Called from JS.
+#[napi]
+pub fn stream_end(stream_id: i64) -> napi::Result<()> {
+    let registry = stream_registry();
+    if let Some((_, sender)) = registry.remove(&(stream_id as u64)) {
+        let _ = sender.send(StreamMessage::End);
+    }
+    Ok(())
+}
 
 /// Get a session value by key. Returns JSON string or null.
 #[napi]
@@ -631,6 +683,10 @@ struct ParsedRequest<'a> {
     headers: Vec<(&'a str, &'a str)>,
     /// Raw cookie header value for session extraction
     cookie_header: Option<&'a str>,
+    /// True when the request contains an Upgrade: websocket header
+    is_websocket_upgrade: bool,
+    /// The Sec-WebSocket-Key header value, if present
+    ws_key: Option<&'a str>,
 }
 
 use monoio::time::timeout;
@@ -786,6 +842,25 @@ where
                     return Ok(());
                 }
                 continue;
+            }
+        }
+
+        // ── WebSocket upgrade check ──
+        if parsed.is_websocket_upgrade {
+            if let Some(ws_key) = parsed.ws_key {
+                if let Some(ws_handler_id) = router.match_ws_route(std::str::from_utf8(parsed.path).unwrap_or("/")) {
+                    let accept_key = crate::websocket::compute_accept_key(ws_key);
+                    let upgrade_response = crate::websocket::build_upgrade_response(&accept_key);
+                    drop(parsed);
+                    drain_consumed_bytes(buffer, header_bytes);
+
+                    let (write_result, _) = stream.write_all(upgrade_response).await;
+                    write_result?;
+
+                    // Enter WebSocket frame loop
+                    handle_websocket_connection(stream, buffer, ws_handler_id, dispatcher).await?;
+                    return Ok(());
+                }
             }
         }
 
@@ -957,6 +1032,8 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
     let mut content_length: Option<usize> = None;
     let mut has_chunked_te = false;
     let mut cookie_header: Option<&str> = None;
+    let mut is_websocket_upgrade = false;
+    let mut ws_key: Option<&str> = None;
     let mut headers = Vec::with_capacity(req.headers.len());
 
     for header in req.headers.iter() {
@@ -1010,6 +1087,16 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
             cookie_header = Some(value);
         }
 
+        // WebSocket: detect upgrade request
+        if name.eq_ignore_ascii_case("upgrade") {
+            if value.eq_ignore_ascii_case("websocket") {
+                is_websocket_upgrade = true;
+            }
+        }
+        if name.eq_ignore_ascii_case("sec-websocket-key") {
+            ws_key = Some(value);
+        }
+
         headers.push((name, value));
     }
 
@@ -1024,6 +1111,8 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
         has_chunked_te,
         headers,
         cookie_header,
+        is_websocket_upgrade,
+        ws_key,
     })
 }
 
@@ -1102,6 +1191,8 @@ fn parse_hot_root_request(
         has_chunked_te: false,
         headers: Vec::new(),
         cookie_header: None, // Hot path doesn't parse cookies
+        is_websocket_upgrade: false,
+        ws_key: None,
     })
 }
 
@@ -1259,6 +1350,8 @@ fn build_dispatch_decision_owned(
              has_chunked_te: false,
              headers: header_refs.clone(),
              cookie_header: None,
+             is_websocket_upgrade: false,
+             ws_key: None,
          };
          let key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
          cache_insertion = Some((matched_route.handler_id, key, cfg.max_entries, cfg.ttl_secs));
@@ -2041,6 +2134,114 @@ where
 {
     match dispatcher.dispatch(request).await {
         Ok(response) => {
+            // ── Stream-start sentinel: 0xFF 0x53 ──
+            // If JS returns a stream-start envelope instead of a normal response,
+            // we enter chunked transfer mode and pipe chunks from JS via the
+            // global stream registry.
+            if response.len() >= 14 && response[0] == 0xFF && response[1] == 0x53 {
+                let mut off = 2usize;
+                let stream_id = u64::from_le_bytes(
+                    response[off..off + 8]
+                        .try_into()
+                        .map_err(|_| anyhow!("stream envelope truncated"))?,
+                );
+                off += 8;
+                let status =
+                    u16::from_le_bytes([response[off], response[off + 1]]);
+                off += 2;
+                let header_count =
+                    u16::from_le_bytes([response[off], response[off + 1]]) as usize;
+                off += 2;
+
+                // Create the channel — Sender goes into the registry so JS can push
+                // chunks; we keep the Receiver locally for the write loop.
+                let (tx, rx) = flume::bounded::<StreamMessage>(16);
+                stream_registry().insert(stream_id, tx);
+
+                // Build HTTP/1.1 response headers with chunked transfer-encoding
+                let reason = status_reason(status);
+                let connection = if keep_alive { "keep-alive" } else { "close" };
+                let mut output = Vec::with_capacity(256);
+                output.extend_from_slice(b"HTTP/1.1 ");
+                write_u16(&mut output, status);
+                output.push(b' ');
+                output.extend_from_slice(reason.as_bytes());
+                output.extend_from_slice(b"\r\ntransfer-encoding: chunked\r\nconnection: ");
+                output.extend_from_slice(connection.as_bytes());
+                output.extend_from_slice(b"\r\n");
+
+                // Parse user headers from the envelope
+                for _ in 0..header_count {
+                    if off >= response.len() {
+                        break;
+                    }
+                    let name_len = response[off] as usize;
+                    off += 1;
+                    if off + 2 > response.len() {
+                        break;
+                    }
+                    let value_len = u16::from_le_bytes([response[off], response[off + 1]]) as usize;
+                    off += 2;
+                    if off + name_len + value_len > response.len() {
+                        break;
+                    }
+                    let name = &response[off..off + name_len];
+                    off += name_len;
+                    let value = &response[off..off + value_len];
+                    off += value_len;
+
+                    // Skip headers we manage ourselves
+                    if name.eq_ignore_ascii_case(b"transfer-encoding")
+                        || name.eq_ignore_ascii_case(b"content-length")
+                        || name.eq_ignore_ascii_case(b"connection")
+                    {
+                        continue;
+                    }
+
+                    output.extend_from_slice(name);
+                    output.extend_from_slice(b": ");
+                    output.extend_from_slice(value);
+                    output.extend_from_slice(b"\r\n");
+                }
+                output.extend_from_slice(b"\r\n");
+
+                // Write the header block to the TCP stream
+                let (write_result, _) = stream.write_all(output).await;
+                write_result?;
+
+                // Chunked transfer loop — read from channel, write to TCP
+                loop {
+                    match rx.recv_async().await {
+                        Ok(StreamMessage::Chunk(data)) => {
+                            if data.is_empty() {
+                                continue;
+                            }
+                            // HTTP/1.1 chunked format: {hex_len}\r\n{data}\r\n
+                            let hex_len = format!("{:x}", data.len());
+                            let mut chunk_buf = Vec::with_capacity(hex_len.len() + 2 + data.len() + 2);
+                            chunk_buf.extend_from_slice(hex_len.as_bytes());
+                            chunk_buf.extend_from_slice(b"\r\n");
+                            chunk_buf.extend_from_slice(&data);
+                            chunk_buf.extend_from_slice(b"\r\n");
+                            let (wr, _) = stream.write_all(chunk_buf).await;
+                            if wr.is_err() {
+                                stream_registry().remove(&stream_id);
+                                break;
+                            }
+                        }
+                        Ok(StreamMessage::End) | Err(_) => {
+                            // Final chunk: 0\r\n\r\n
+                            let (wr, _) = stream.write_all(b"0\r\n\r\n".to_vec()).await;
+                            let _ = wr;
+                            stream_registry().remove(&stream_id);
+                            break;
+                        }
+                    }
+                }
+
+                return Ok(());
+            }
+
             match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
                 Ok(mut http_response) => {
                     if let Some((handler_id, cache_key, max_entries, ttl_secs)) = cache_insertion {
@@ -2291,6 +2492,114 @@ fn resolve_session(
     // No valid session cookie — generate a new session ID
     let new_id = store.generate_id();
     (Some(new_id), true)
+}
+
+// ─── WebSocket Connection Handler ──────
+
+async fn handle_websocket_connection<S>(
+    stream: &mut S,
+    buffer: &mut Vec<u8>,
+    handler_id: u32,
+    dispatcher: &JsDispatcher,
+) -> Result<()>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::AsyncWriteRentExt,
+{
+    use crate::websocket::*;
+
+    let ws_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+
+    // Create channel for outbound messages (JS → Rust → client)
+    let (tx, rx) = flume::bounded::<StreamMessage>(64);
+    stream_registry().insert(ws_id, tx);
+
+    // Dispatch "open" event to JS
+    let open_envelope = build_ws_event_envelope(0x01, ws_id, handler_id, &[]);
+    let _ = dispatcher.dispatch(Buffer::from(open_envelope)).await;
+
+    buffer.clear();
+
+    loop {
+        // Try to parse a frame from the buffer
+        if let Some((frame, consumed)) = parse_frame(buffer) {
+            buffer.drain(..consumed);
+
+            match frame.opcode {
+                OPCODE_TEXT | OPCODE_BINARY => {
+                    let msg_envelope =
+                        build_ws_event_envelope(0x02, ws_id, handler_id, &frame.payload);
+                    let _ = dispatcher.dispatch(Buffer::from(msg_envelope)).await;
+                }
+                OPCODE_PING => {
+                    let pong = encode_frame(OPCODE_PONG, &frame.payload);
+                    let (res, _) = stream.write_all(pong).await;
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                OPCODE_CLOSE => {
+                    let close = encode_close_frame(1000, "");
+                    let (res, _) = stream.write_all(close).await;
+                    let _ = res;
+                    break;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Check for outbound messages from JS
+        match rx.try_recv() {
+            Ok(StreamMessage::Chunk(data)) => {
+                let frame = encode_frame(OPCODE_TEXT, &data);
+                let (res, _) = stream.write_all(frame).await;
+                if res.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Ok(StreamMessage::End) => {
+                let close = encode_close_frame(1000, "");
+                let (res, _) = stream.write_all(close).await;
+                let _ = res;
+                break;
+            }
+            Err(flume::TryRecvError::Empty) => {}
+            Err(flume::TryRecvError::Disconnected) => break,
+        }
+
+        // Read more data from the client
+        let owned_buf = std::mem::take(buffer);
+        let (read_result, returned_buf) = stream.read(owned_buf).await;
+        *buffer = returned_buf;
+        match read_result {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    // Cleanup
+    stream_registry().remove(&ws_id);
+
+    // Dispatch "close" event to JS
+    let close_envelope = build_ws_event_envelope(0x03, ws_id, handler_id, &[]);
+    let _ = dispatcher.dispatch(Buffer::from(close_envelope)).await;
+
+    Ok(())
+}
+
+/// Build a WebSocket event envelope for dispatching to JS.
+/// Layout: 0xFE | eventType(1) | wsId(8 LE) | handlerId(4 LE) | dataLen(4 LE) | data
+fn build_ws_event_envelope(event_type: u8, ws_id: u64, handler_id: u32, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(18 + data.len());
+    buf.push(0xFE); // WS event sentinel
+    buf.push(event_type);
+    buf.extend_from_slice(&ws_id.to_le_bytes());
+    buf.extend_from_slice(&handler_id.to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    buf
 }
 
 /// Inject a Set-Cookie header into an already-built HTTP response.

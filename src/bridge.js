@@ -686,6 +686,70 @@ export function encodeResponseEnvelope(snapshot) {
   return output;
 }
 
+/**
+ * Encode a stream-start envelope for chunked streaming responses.
+ * Layout: sentinel(2) 0xFF 0x53 | streamId(8) | status(2) | headerCount(2) | headers...
+ *
+ * @param {number} streamId
+ * @param {{ status: number, headers: Object }} snapshot
+ * @returns {Buffer}
+ */
+export function encodeStreamStartEnvelope(streamId, snapshot) {
+  const rawHeaders = snapshot.headers;
+  const headerKeys = rawHeaders ? Object.keys(rawHeaders) : [];
+  const headerCount = headerKeys.length;
+
+  // Encode headers
+  const encodedHeaders = new Array(headerCount);
+  let headersSize = 0;
+  for (let i = 0; i < headerCount; i++) {
+    const name = headerKeys[i];
+    const nameBytes = getCachedHeaderNameBytes(name);
+    const valueBytes = textEncoder.encode(String(rawHeaders[name]));
+    encodedHeaders[i] = [nameBytes, valueBytes];
+    headersSize += 3 + nameBytes.length + valueBytes.length;
+  }
+
+  // sentinel(2) + streamId(8) + status(2) + headerCount(2) + headers
+  const totalLength = 2 + 8 + 2 + 2 + headersSize;
+  const output = Buffer.allocUnsafe(totalLength);
+  let offset = 0;
+
+  // Stream sentinel
+  output[offset++] = 0xff;
+  output[offset++] = 0x53;
+
+  // Stream ID (u64 LE) — use two u32 writes since JS doesn't have u64
+  const low = streamId & 0xffffffff;
+  const high = (streamId / 0x100000000) >>> 0;
+  writeU32(output, offset, low);
+  offset += 4;
+  writeU32(output, offset, high);
+  offset += 4;
+
+  // Status
+  writeU16(output, offset, Number(snapshot.status ?? 200));
+  offset += 2;
+
+  // Header count
+  writeU16(output, offset, headerCount);
+  offset += 2;
+
+  // Headers (same format as regular response)
+  for (let i = 0; i < headerCount; i++) {
+    const [nameBytes, valueBytes] = encodedHeaders[i];
+    output[offset++] = nameBytes.length;
+    writeU16(output, offset, valueBytes.length);
+    offset += 2;
+    output.set(nameBytes, offset);
+    offset += nameBytes.length;
+    output.set(valueBytes, offset);
+    offset += valueBytes.length;
+  }
+
+  return output;
+}
+
 // ─── Object Materialization (Security-Hardened) ───────────────────────────────
 //
 // All user-facing objects use Object.create(null) to prevent prototype pollution.

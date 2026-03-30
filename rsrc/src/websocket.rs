@@ -7,6 +7,7 @@ use base64::Engine;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// WebSocket opcodes
+#[allow(dead_code)]
 pub const OPCODE_CONTINUATION: u8 = 0x0;
 pub const OPCODE_TEXT: u8 = 0x1;
 pub const OPCODE_BINARY: u8 = 0x2;
@@ -17,6 +18,7 @@ pub const OPCODE_PONG: u8 = 0xA;
 /// Max frame payload (16 MB)
 const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
+#[allow(dead_code)]
 pub struct WsFrame {
     pub fin: bool,
     pub opcode: u8,

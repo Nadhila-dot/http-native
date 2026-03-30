@@ -13,3 +13,4 @@ old/
 zig-httpz
 .github/bench/results/
 testing/
+bench

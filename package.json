@@ -1,6 +1,6 @@
 {
   "name": "@http-native/core",
-  "version": "0.0.3.1",
+  "version": "0.0.4",
   "type": "module",
   "publishConfig": {
     "access": "public"

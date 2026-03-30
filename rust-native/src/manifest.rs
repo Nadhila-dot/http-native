@@ -10,6 +10,8 @@ pub struct ManifestInput {
     pub middlewares: Vec<MiddlewareInput>,
     pub routes: Vec<RouteInput>,
     #[serde(default)]
+    pub ws_routes: Vec<WsRouteInput>,
+    #[serde(default)]
     pub session: Option<SessionConfigInput>,
 }
 
@@ -113,4 +115,11 @@ pub struct CacheConfigInput {
 pub struct CacheVaryInput {
     pub source: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsRouteInput {
+    pub path: String,
+    pub handler_id: u32,
 }

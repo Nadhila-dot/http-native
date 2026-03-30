@@ -10,6 +10,7 @@ import {
   createRequestFactory,
   decodeRequestEnvelope,
   encodeResponseEnvelope,
+  encodeStreamStartEnvelope,
   mergeRequestAccessPlans,
   releaseRequestObject,
 } from "./bridge.js";
@@ -161,6 +162,8 @@ function acquireResponseState() {
     pooled.finished = false;
     pooled.locals = Object.create(null);
     pooled.ncache = null;
+    pooled.streaming = false;
+    pooled.streamId = null;
     return pooled;
   }
 
@@ -171,6 +174,8 @@ function acquireResponseState() {
     finished: false,
     locals: Object.create(null),
     ncache: null,
+    streaming: false,
+    streamId: null,
   };
 }
 
@@ -311,6 +316,58 @@ const RESPONSE_PROTO = {
     state.ncache = { ttl: ttlSecs, maxEntries };
 
     return this;
+  },
+
+  stream(options = {}) {
+    const state = this._state;
+    if (state.finished) {
+      return null;
+    }
+
+    // Load native module for stream NAPI calls
+    const native = loadNativeModule();
+    const streamId = native.streamCreate();
+
+    // Set default content-type if not set
+    if (!state.headers["content-type"]) {
+      state.headers["content-type"] = options.contentType || "application/octet-stream";
+    }
+
+    state.finished = true;
+    state.streaming = true;
+    state.streamId = streamId;
+
+    const encoder = new TextEncoder();
+
+    return {
+      /** Write a chunk to the stream */
+      write(data) {
+        let chunk;
+        if (typeof data === "string") {
+          chunk = Buffer.from(data, "utf8");
+        } else if (Buffer.isBuffer(data)) {
+          chunk = data;
+        } else if (data instanceof Uint8Array) {
+          chunk = Buffer.from(data);
+        } else if (typeof data === "object") {
+          chunk = Buffer.from(JSON.stringify(data), "utf8");
+        } else {
+          chunk = Buffer.from(String(data), "utf8");
+        }
+        return native.streamWrite(streamId, chunk);
+      },
+
+      /** End the stream */
+      end(finalChunk) {
+        if (finalChunk !== undefined) {
+          this.write(finalChunk);
+        }
+        return native.streamEnd(streamId);
+      },
+
+      /** The stream ID (for internal use) */
+      id: streamId,
+    };
   },
 };
 
@@ -480,8 +537,10 @@ function createDispatcher(
   runtimeOptimizer,
   errorHandlers = [],
   devRouteCommentWriter = null,
+  wsRoutes = [],
 ) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
+  const wsRoutesById = new Map(wsRoutes.map((r) => [r.handlerId, r]));
   const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
   const trackDispatchTiming =
     runtimeOptimizer?.shouldCaptureDispatchTiming?.() === true;
@@ -516,6 +575,46 @@ function createDispatcher(
   }
 
   return async function dispatch(requestBuffer) {
+    // WebSocket event dispatch (sentinel 0xFE)
+    if (requestBuffer[0] === 0xFE) {
+      const eventType = requestBuffer[1];
+      const wsId = Number(requestBuffer.readBigUInt64LE(2));
+      const handlerId = requestBuffer.readUInt32LE(10);
+      const dataLen = requestBuffer.readUInt32LE(14);
+      const data = dataLen > 0 ? requestBuffer.subarray(18, 18 + dataLen) : null;
+
+      const route = wsRoutesById.get(handlerId);
+      if (!route) return EMPTY_BUFFER;
+
+      const native = loadNativeModule();
+      const ws = {
+        send(msg) {
+          const chunk = typeof msg === "string" ? Buffer.from(msg, "utf8") : Buffer.from(msg);
+          native.streamWrite(Number(wsId), chunk);
+        },
+        close(code = 1000, reason = "") {
+          native.streamEnd(Number(wsId));
+        },
+        id: wsId,
+      };
+
+      try {
+        switch (eventType) {
+          case 0x01: await route.handlers.open?.(ws); break;
+          case 0x02: {
+            const textData = data ? new TextDecoder().decode(data) : "";
+            await route.handlers.message?.(ws, textData);
+            break;
+          }
+          case 0x03: await route.handlers.close?.(ws); break;
+        }
+      } catch (err) {
+        console.error("[http-native] WebSocket handler error:", err);
+      }
+
+      return EMPTY_BUFFER;
+    }
+
     let decoded;
 
     try {
@@ -572,6 +671,15 @@ function createDispatcher(
     }
 
     const responseSnapshot = snapshot();
+
+    // Handle streaming responses — return stream-start envelope instead of normal response
+    if (res._state?.streaming) {
+      const streamEnvelope = encodeStreamStartEnvelope(res._state.streamId, responseSnapshot);
+      releaseRequestObject(req);
+      // Don't release response state — stream is still active
+      return streamEnvelope;
+    }
+
     const dispatchDurationMs = trackDispatchTiming
       ? performance.now() - dispatchStartMs
       : undefined;
@@ -956,6 +1064,7 @@ export function createApp() {
     _routes: [],
     _middlewares: [],
     _errorHandlers: [],
+    _wsRoutes: [],
     _groupPrefix: "/",
 
     use(pathOrMiddleware, maybeMiddleware) {
@@ -1126,6 +1235,10 @@ export function createApp() {
               : null,
             needsSession: /\breq\.session\b|\breq\.sessionId\b/.test(route.handlerSource),
           })),
+          wsRoutes: this._wsRoutes.map((ws) => ({
+            path: ws.path,
+            handlerId: ws.handlerId,
+          })),
         };
 
         if (normalizedOptions.tls) {
@@ -1185,6 +1298,7 @@ export function createApp() {
           runtimeOptimizer,
           this._errorHandlers,
           devRouteCommentWriter,
+          this._wsRoutes,
         );
         // Hot reload: override port/host if the hot reloader is active
         const hotCtx = globalThis.__HTTP_NATIVE_HOT__;
@@ -1360,6 +1474,18 @@ export function createApp() {
 
       return chainableListen;
     },
+  };
+
+  app.ws = (path, handlers) => {
+    if (typeof handlers !== "object") {
+      throw new TypeError("WebSocket handlers must be an object with open/message/close");
+    }
+    app._wsRoutes.push({
+      path: normalizeRoutePath("GET", path),
+      handlers,
+      handlerId: nextHandlerId++,
+    });
+    return app;
   };
 
   app.get = createMethodRegistrar(app, "GET");

@@ -29,6 +29,7 @@ const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
 const NOOP_NEXT = () => undefined;
 const ROUTE_CACHE_PROMOTE_HITS = 16;
+const NATIVE_CLOSE_TIMEOUT_MS = 2500;
 const ERROR_REQUEST_PLAN = Object.freeze({
   method: true,
   path: true,
@@ -992,6 +993,7 @@ function normalizeListenOptions(options = {}) {
   const serverConfig = normalizeHttpServerConfig(
     options.serverConfig ?? options.httpServerConfig ?? defaultHttpServerConfig,
   );
+  const hasHotRuntimeContext = Boolean(globalThis.__HTTP_NATIVE_HOT__);
   const optionOpt = options.opt ?? null;
   const normalizedOpt = {
     notify: optionOpt?.notify ?? true,
@@ -1008,7 +1010,7 @@ function normalizeListenOptions(options = {}) {
       optionOpt?.devComments ?? process.env.HTTP_NATIVE_DEV_COMMENTS !== "0",
   };
 
-  if (normalizedOpt.hotReload) {
+  if (normalizedOpt.hotReload || hasHotRuntimeContext) {
     // Avoid auto-generated source edits causing restart loops in dev hot-reload mode.
     normalizedOpt.devComments = false;
   }
@@ -1046,6 +1048,31 @@ function registerDevCommentProcessCleanup(devRouteCommentWriter) {
     process.off("beforeExit", cleanup);
     process.off("exit", cleanup);
   };
+}
+
+async function closeNativeServerHandle(handle, timeoutMs = NATIVE_CLOSE_TIMEOUT_MS) {
+  let timeoutId = null;
+  let completed = false;
+
+  try {
+    await Promise.race([
+      Promise.resolve(handle.close()).then(() => {
+        completed = true;
+      }),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(resolve, timeoutMs);
+        if (typeof timeoutId.unref === "function") {
+          timeoutId.unref();
+        }
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  return completed;
 }
 
 // ─── Application Factory ───────────────
@@ -1322,7 +1349,12 @@ export function createApp() {
           runtimeOptimizer?.dispose?.();
           devRouteCommentWriter?.cleanup?.();
           detachDevCommentProcessCleanup();
-          await Promise.resolve(handle.close());
+          const closed = await closeNativeServerHandle(handle);
+          if (!closed && process.env.NODE_ENV !== "production") {
+            console.warn(
+              `[http-native] native server close timed out after ${NATIVE_CLOSE_TIMEOUT_MS}ms; continuing shutdown`,
+            );
+          }
         };
 
         const hotReloadController = createHotReloadController({

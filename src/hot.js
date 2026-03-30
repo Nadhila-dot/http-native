@@ -23,7 +23,10 @@ import { watch } from "node:fs";
 import { resolve, dirname, extname } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { normalizeHttpServerConfig } from "./http-server.config.js";
+
 const DEBOUNCE_MS = 100;
+const STARTUP_IGNORE_MS = 250;
 const WATCHABLE_EXTENSIONS = new Set([".js", ".ts", ".mjs", ".mts", ".json"]);
 
 /**
@@ -33,6 +36,9 @@ const WATCHABLE_EXTENSIONS = new Set([".js", ".ts", ".mjs", ".mts", ".json"]);
  * @param {Object} [options]
  * @param {number} [options.port]  - Port to listen on (default 3000)
  * @param {string} [options.host]  - Host to bind (default "127.0.0.1")
+ * @param {Object} [options.opt]   - Runtime optimization options
+ * @param {Object} [options.serverConfig] - Server config override
+ * @param {Object} [options.httpServerConfig] - Alias of serverConfig
  * @param {string|string[]} [options.watch] - Directories/files to watch (default: app module's directory)
  * @param {boolean} [options.clear] - Clear console on reload (default true)
  * @param {Function} [options.onReload] - Callback after successful reload
@@ -40,8 +46,18 @@ const WATCHABLE_EXTENSIONS = new Set([".js", ".ts", ".mjs", ".mts", ".json"]);
  */
 export async function hot(appModulePath, options = {}) {
   const absolutePath = resolve(process.cwd(), appModulePath);
+  const serverConfig = normalizeHttpServerConfig(
+    options.serverConfig ?? options.httpServerConfig ?? {},
+  );
+  const runtimeOptInput =
+    options.opt && typeof options.opt === "object" ? options.opt : {};
+  const runtimeOpt = {
+    ...runtimeOptInput,
+    notify: false,
+    devComments: false,
+  };
   const port = options.port ?? 3000;
-  const host = options.host ?? "127.0.0.1";
+  const host = options.host ?? serverConfig.defaultHost;
   const clearConsole = options.clear ?? true;
   const onReload = options.onReload ?? null;
   const onError = options.onError ?? null;
@@ -56,12 +72,19 @@ export async function hot(appModulePath, options = {}) {
   let currentServer = null;
   let reloadVersion = 0;
   let debounceTimer = null;
-  let isReloading = false;
+  let isReloading = true;
+  let disposed = false;
+  let watchReadyAt = Date.now() + STARTUP_IGNORE_MS;
 
   /**
    * Load (or reload) the app module and start the server.
    */
   async function loadAndStart() {
+    if (disposed) {
+      return;
+    }
+
+    isReloading = true;
     const version = ++reloadVersion;
 
     // Gracefully close the existing server and wait for port release
@@ -97,11 +120,15 @@ export async function hot(appModulePath, options = {}) {
         const app = mod.default ?? mod.app ?? mod;
 
         if (app && typeof app.listen === "function") {
-          currentServer = await app.listen({
-            port,
-            host,
-            opt: { notify: false },
+          let listenHandle = app.listen({
+            serverConfig: {
+              ...serverConfig,
+              defaultHost: host,
+            },
           });
+          listenHandle = listenHandle.port(port);
+          listenHandle = listenHandle.opt(runtimeOpt);
+          currentServer = await listenHandle;
         } else {
           // Nothing worked — the module probably self-started but we missed
           // the capture. This can happen if listen() failed silently.
@@ -141,15 +168,17 @@ export async function hot(appModulePath, options = {}) {
    * Debounced reload triggered by file changes.
    */
   function scheduleReload(filename) {
-    if (isReloading) return;
+    if (disposed || isReloading) return;
 
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
-      isReloading = true;
+      if (disposed) {
+        return;
+      }
       console.log(
         `\x1b[33m[hot]\x1b[0m File changed: ${filename ?? "unknown"} — reloading...`,
       );
-      loadAndStart();
+      void loadAndStart();
     }, DEBOUNCE_MS);
   }
 
@@ -159,6 +188,7 @@ export async function hot(appModulePath, options = {}) {
     try {
       const watcher = watch(watchPath, { recursive: true }, (event, filename) => {
         if (!filename) return;
+        if (disposed || Date.now() < watchReadyAt) return;
 
         // Only reload for relevant file types
         const ext = extname(filename).toLowerCase();
@@ -183,32 +213,42 @@ export async function hot(appModulePath, options = {}) {
   }
 
   // Cleanup on exit
-  function cleanup() {
+  async function cleanup() {
+    disposed = true;
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+
     for (const w of watchers) {
       try {
         w.close();
       } catch {}
     }
+
     if (currentServer) {
+      const server = currentServer;
+      currentServer = null;
       try {
-        currentServer.close();
+        await Promise.resolve(server.close());
       } catch {}
     }
   }
 
-  process.on("SIGINT", () => {
+  process.on("SIGINT", async () => {
     console.log("\n\x1b[32m[hot]\x1b[0m Shutting down...");
-    cleanup();
+    await cleanup();
     process.exit(0);
   });
 
-  process.on("SIGTERM", () => {
-    cleanup();
+  process.on("SIGTERM", async () => {
+    await cleanup();
     process.exit(0);
   });
 
   // Initial load
   await loadAndStart();
+  watchReadyAt = Date.now() + STARTUP_IGNORE_MS;
 
   return {
     /** Manually trigger a reload */
@@ -217,7 +257,7 @@ export async function hot(appModulePath, options = {}) {
     },
     /** Stop watching and close the server */
     close() {
-      cleanup();
+      return cleanup();
     },
   };
 }

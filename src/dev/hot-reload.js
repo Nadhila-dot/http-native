@@ -145,7 +145,9 @@ export function createRuntimeHotReloadController(options = {}) {
 
       process.exit(child ? 0 : 1);
     },
-    log,
+    log(message) {
+      emit("warn", message);
+    },
   });
 
   emit(

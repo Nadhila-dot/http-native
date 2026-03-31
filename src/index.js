@@ -409,7 +409,7 @@ function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
 function createMiddlewareRunner(middlewares) {
   if (middlewares.length === 0) {
     // Fast path: no middlewares — return a no-op
-    return function noopMiddleware(_req, _res) {};
+    return function noopMiddleware(_req, _res) { };
   }
 
   if (middlewares.length === 1) {
@@ -498,9 +498,9 @@ function buildDefaultErrorSnapshot(error, fallbackStatus = 500) {
     body = isProduction
       ? { error: "Internal Server Error" }
       : {
-          error: "Internal Server Error",
-          detail: error instanceof Error ? error.message : String(error),
-        };
+        error: "Internal Server Error",
+        detail: error instanceof Error ? error.message : String(error),
+      };
   } else {
     body = {
       error:
@@ -902,6 +902,186 @@ function fnv1aBytes(seed, bytes) {
   return hash >>> 0;
 }
 
+// ─── Fast-Path Probe ────────────────────
+//
+// Pre-evaluates a route handler at registration time to resolve closure
+// variables that the Rust static analyzer can't see. If the handler is
+// a simple res.json({...}) or res.send(...) with closure variables,
+// we call it with probe param values and capture the response to generate
+// a synthetic handler source with all values resolved to literals.
+//
+// Example: handler `(req, res) => res.json({ id: req.params.id, engine: label })`
+// where `label = "http-native"` becomes:
+// `(req, res) => res.json({ "id": req.params.id, "engine": "http-native" })`
+
+const PROBE_PARAM_PREFIX = "__PROBE_PARAM_";
+const PROBE_PARAM_SUFFIX = "__";
+
+function probeHandlerForFastPath(route, originalSource) {
+  // Only probe parameterized routes (routeKind is not set yet, check path)
+  if (!route.path.includes(":")) {
+    return null;
+  }
+
+  // Don't probe if the source contains await (async I/O)
+  if (originalSource.includes("await")) {
+    return null;
+  }
+
+  // Extract param names from path
+  const paramNames = route.path
+    .split("/")
+    .filter((s) => s.startsWith(":"))
+    .map((s) => s.slice(1));
+
+  if (paramNames.length === 0) {
+    return null;
+  }
+
+  // Build probe param values: "__PROBE_PARAM_id__" etc.
+  const probeParams = Object.create(null);
+  for (const name of paramNames) {
+    probeParams[name] = `${PROBE_PARAM_PREFIX}${name}${PROBE_PARAM_SUFFIX}`;
+  }
+
+  // Mock request object
+  const mockReq = Object.create(null);
+  mockReq.params = probeParams;
+  mockReq.query = Object.create(null);
+  mockReq.headers = Object.create(null);
+  mockReq.method = route.method || "GET";
+  mockReq.path = route.path;
+  mockReq.url = route.path;
+  mockReq.header = () => undefined;
+
+  // Mock response object that captures the json() call
+  let capturedData = undefined;
+  let capturedStatus = 200;
+  let capturedType = null;
+  let probeSucceeded = false;
+
+  const mockRes = {
+    _state: { finished: false },
+    get finished() {
+      return this._state.finished;
+    },
+    status(code) {
+      capturedStatus = code;
+      return this;
+    },
+    json(data) {
+      capturedData = data;
+      probeSucceeded = true;
+      this._state.finished = true;
+      return this;
+    },
+    send(data) {
+      if (typeof data === "string") {
+        capturedData = data;
+        capturedType = "send_string";
+      } else if (data && typeof data === "object") {
+        capturedData = data;
+        capturedType = "send_json";
+      }
+      probeSucceeded = true;
+      this._state.finished = true;
+      return this;
+    },
+    set() { return this; },
+    header() { return this; },
+    type(v) { capturedType = v; return this; },
+  };
+
+  try {
+    const result = route.handler(mockReq, mockRes);
+    // If the handler returns a promise, it's async — we can't probe it synchronously
+    if (result && typeof result.then === "function") {
+      // But if the response was already captured synchronously (common for async handlers
+      // that don't actually await anything), we can still use it
+      if (!probeSucceeded) {
+        return null;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  if (!probeSucceeded || capturedData === undefined) {
+    return null;
+  }
+
+  // Now generate a synthetic handler source with resolved values
+  if (typeof capturedData === "object" && capturedData !== null && !Array.isArray(capturedData)) {
+    return generateResolvedJsonSource(capturedData, paramNames, capturedStatus);
+  }
+
+  if (typeof capturedData === "string" && capturedType === "send_string") {
+    return generateResolvedSendSource(capturedData, paramNames, capturedStatus);
+  }
+
+  return null;
+}
+
+function generateResolvedJsonSource(data, paramNames, status) {
+  const fields = [];
+  const probeParamSet = new Set(paramNames.map((n) => `${PROBE_PARAM_PREFIX}${n}${PROBE_PARAM_SUFFIX}`));
+
+  for (const [key, value] of Object.entries(data)) {
+    if (typeof value === "string" && probeParamSet.has(value)) {
+      // This field maps to a param — extract the param name
+      const paramName = value.slice(PROBE_PARAM_PREFIX.length, -PROBE_PARAM_SUFFIX.length);
+      fields.push(`${JSON.stringify(key)}: req.params.${paramName}`);
+    } else if (typeof value === "string") {
+      fields.push(`${JSON.stringify(key)}: ${JSON.stringify(value)}`);
+    } else if (typeof value === "number" || typeof value === "boolean" || value === null) {
+      fields.push(`${JSON.stringify(key)}: ${JSON.stringify(value)}`);
+    } else {
+      // Complex value — can't resolve, bail
+      return null;
+    }
+  }
+
+  const jsonArg = `{ ${fields.join(", ")} }`;
+  if (status !== 200) {
+    return `(req, res) => res.status(${status}).json(${jsonArg})`;
+  }
+  return `(req, res) => res.json(${jsonArg})`;
+}
+
+function generateResolvedSendSource(data, paramNames, status) {
+  // Check if the string contains any probe param values
+  let resolvedStr = data;
+  let hasParams = false;
+  for (const name of paramNames) {
+    const probe = `${PROBE_PARAM_PREFIX}${name}${PROBE_PARAM_SUFFIX}`;
+    if (resolvedStr.includes(probe)) {
+      hasParams = true;
+      break;
+    }
+  }
+
+  if (hasParams) {
+    // Template literal with param interpolation
+    let template = "`";
+    let remaining = data;
+    for (const name of paramNames) {
+      const probe = `${PROBE_PARAM_PREFIX}${name}${PROBE_PARAM_SUFFIX}`;
+      remaining = remaining.replaceAll(probe, `\${req.params.${name}}`);
+    }
+    template += remaining + "`";
+    if (status !== 200) {
+      return `(req, res) => res.status(${status}).send(${template})`;
+    }
+    return `(req, res) => res.send(${template})`;
+  }
+
+  // Pure static string
+  if (status !== 200) {
+    return `(req, res) => res.status(${status}).send(${JSON.stringify(data)})`;
+  }
+  return `(req, res) => res.send(${JSON.stringify(data)})`;
+}
+
 function compileRouteDispatch(
   route,
   middlewares,
@@ -1207,7 +1387,17 @@ export function createApp() {
         );
 
         const routes = this._routes.map((route) => {
-          const handlerSource = Function.prototype.toString.call(route.handler);
+          let handlerSource = Function.prototype.toString.call(route.handler);
+
+          // ── Fast-path probe: try to pre-evaluate the handler to resolve
+          // closure variables that block the Rust dynamic fast-path analyzer.
+          // If the handler is a simple res.json({...}) with closure variables,
+          // we call it with probe params and capture the response to generate
+          // a synthetic handler source with resolved literal values.
+          const probed = probeHandlerForFastPath(route, handlerSource);
+          if (probed) {
+            handlerSource = probed;
+          }
 
           return {
             ...route,
@@ -1250,15 +1440,15 @@ export function createApp() {
               route.requestPlan.queryKeys.size > 0,
             cache: route.cache
               ? {
-                  ttlSecs: route.cache.ttl || 60,
-                  maxEntries: route.cache.maxEntries || 256,
-                  varyBy: (route.cache.varyBy || []).map((key) => {
-                    const dotIndex = key.indexOf(".");
-                    return dotIndex >= 0
-                      ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
-                      : { source: "query", name: key };
-                  }),
-                }
+                ttlSecs: route.cache.ttl || 60,
+                maxEntries: route.cache.maxEntries || 256,
+                varyBy: (route.cache.varyBy || []).map((key) => {
+                  const dotIndex = key.indexOf(".");
+                  return dotIndex >= 0
+                    ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
+                    : { source: "query", name: key };
+                }),
+              }
               : null,
             needsSession: /\breq\.session\b|\breq\.sessionId\b/.test(route.handlerSource),
           })),

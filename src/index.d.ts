@@ -108,6 +108,9 @@ export interface Response {
   /** Send a JSON response with proper Content-Type */
   json(data: unknown): Response;
 
+  /** Send an HTML response, optionally injecting window.hnSSR.objects */
+  html(html: string, options?: HtmlResponseOptions): Response;
+
   /** Send a response body (string, Buffer, or object) */
   send(data?: string | Buffer | Uint8Array | null): Response;
 
@@ -207,6 +210,15 @@ export interface ReloadOptions {
   debounceMs?: number;
   /** Clear the console after successful reloads */
   clear?: boolean;
+}
+
+export interface HtmlResponseOptions {
+  /** HTTP status code (default: 200) */
+  status?: number;
+  /** Extra response headers */
+  headers?: Record<string, string>;
+  /** Static SSR payload injected as window.hnSSR.objects */
+  objects?: Record<string, unknown> | null;
 }
 
 export interface HotReloadOptions {
@@ -362,6 +374,9 @@ export interface Application {
 
   /** Register a handler for all HTTP methods */
   all(path: string, handler: RouteHandler): Application;
+
+  /** Register an exact GET HTML route served from the native static fast path */
+  static(path: string, html: string, options?: HtmlResponseOptions): Application;
 
   /** Configure first-class app reload behavior for dev runtimes */
   reload(options?: ReloadOptions): Application;

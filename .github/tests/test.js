@@ -124,6 +124,22 @@ async function main() {
   const app = createApp();
   assert.equal(typeof app.error, "function");
 
+  assert.throws(
+    () => app.static("/users/:id", "<html>invalid</html>"),
+    /app\.static\(\) only supports exact GET paths without params/,
+  );
+
+  const middlewareBlockedApp = createApp();
+  middlewareBlockedApp.use(async (_req, _res, next) => {
+    await next();
+  });
+  middlewareBlockedApp.static("/blocked", "<html><body>blocked</body></html>");
+
+  await assert.rejects(
+    () => middlewareBlockedApp.listen({ port: 0 }),
+    /app\.static\(\"\/blocked\"\) cannot be used with applicable middleware/,
+  );
+
   httpServerConfig.tls = {
     cert: "/tst/cert.pem",
     key: "/tst/key.pem"
@@ -163,8 +179,35 @@ async function main() {
       engine: "rust",
     });
   });
+  app.static(
+    "/ssr",
+    "<html><body><main>ssr</main></body></html>",
+    {
+      objects: {
+        page: "ssr",
+        safe: "</script><b>nope</b>",
+      },
+    },
+  );
+  app.static(
+    "/ssr-tail",
+    "<html><main>tail</main></html>",
+    {
+      objects: {
+        page: "tail",
+      },
+    },
+  );
   app.get("/stable", (req, res) => {
     res.json(stablePayload);
+  });
+  app.get("/html-helper", (_req, res) => {
+    res.html("<html><body><main>helper</main></body></html>", {
+      status: 201,
+      objects: {
+        helper: true,
+      },
+    });
   });
   app.get("/native/:id", (req, res) => {
     res.json({
@@ -270,6 +313,29 @@ async function main() {
       ok: true,
       engine: "rust",
     });
+
+    const ssrResponse = await fetch(new URL("/ssr", server.url));
+    assert.equal(ssrResponse.status, 200);
+    assert.equal(ssrResponse.headers.get("content-type"), "text/html; charset=utf-8");
+    const ssrMarkup = await ssrResponse.text();
+    assert.match(
+      ssrMarkup,
+      /<main>ssr<\/main><script>window\.hnSSR=window\.hnSSR\|\|\{\};window\.hnSSR\.objects=/,
+    );
+    assert.match(ssrMarkup, /"page":"ssr"/);
+    assert.doesNotMatch(ssrMarkup, /<\/script><b>nope<\/b>/);
+    assert.match(ssrMarkup, /<\/script><\/body><\/html>$/);
+
+    const ssrTailResponse = await fetch(new URL("/ssr-tail", server.url));
+    assert.equal(ssrTailResponse.status, 200);
+    const ssrTailMarkup = await ssrTailResponse.text();
+    assert.match(ssrTailMarkup, /<\/html><script>/);
+
+    const htmlHelperResponse = await fetch(new URL("/html-helper", server.url));
+    assert.equal(htmlHelperResponse.status, 201);
+    assert.equal(htmlHelperResponse.headers.get("content-type"), "text/html; charset=utf-8");
+    const htmlHelperMarkup = await htmlHelperResponse.text();
+    assert.match(htmlHelperMarkup, /window\.hnSSR\.objects=\{"helper":true\}/);
 
     const userResponse = await fetch(new URL("/users/42", server.url));
     assert.equal(userResponse.status, 200);
@@ -403,6 +469,9 @@ async function main() {
     const stableRoute = snapshot.routes.find(
       (route) => route.method === "GET" && route.path === "/stable",
     );
+    const ssrRoute = snapshot.routes.find(
+      (route) => route.method === "GET" && route.path === "/ssr",
+    );
     const userRoute = snapshot.routes.find(
       (route) => route.method === "GET" && route.path === "/users/:id",
     );
@@ -418,6 +487,7 @@ async function main() {
 
     assert.ok(rootRoute);
     assert.ok(stableRoute);
+    assert.ok(ssrRoute);
     assert.ok(userRoute);
     assert.ok(nativeRoute);
     assert.ok(chainRoute);
@@ -433,6 +503,10 @@ async function main() {
     assert.equal(stableRoute.cacheCandidate, true);
     assert.equal(stableRoute.hits, 32);
     assert.equal(stableRoute.recommendation, null);
+
+    assert.equal(ssrRoute.staticFastPath, true);
+    assert.equal(ssrRoute.binaryBridge, true);
+    assert.equal(ssrRoute.bridgeObserved, false);
 
     assert.equal(userRoute.staticFastPath, false);
     assert.equal(userRoute.binaryBridge, true);
@@ -455,6 +529,7 @@ async function main() {
 
     const summary = server.optimizations.summary();
     assert.match(summary, /GET \/ \[static-fast-path, binary-bridge\]/);
+    assert.match(summary, /GET \/ssr \[static-fast-path, binary-bridge\]/);
     assert.match(summary, /GET \/stable \[bridge-dispatch, binary-bridge, bridge-observed, cache-candidate\]/);
     assert.match(summary, /GET \/users\/:id \[bridge-dispatch, binary-bridge, bridge-observed\]/);
 

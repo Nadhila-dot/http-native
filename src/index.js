@@ -139,6 +139,106 @@ function normalizeContentType(type) {
   return type;
 }
 
+function normalizeHeaderRecord(headers) {
+  if (!headers || typeof headers !== "object") {
+    return Object.create(null);
+  }
+
+  const normalized = Object.create(null);
+  for (const [name, value] of Object.entries(headers)) {
+    const headerName = String(name).toLowerCase();
+    const headerValue = String(value);
+    if (
+      headerName.includes("\r") ||
+      headerName.includes("\n") ||
+      headerValue.includes("\r") ||
+      headerValue.includes("\n")
+    ) {
+      continue;
+    }
+    normalized[headerName] = headerValue;
+  }
+
+  return normalized;
+}
+
+function normalizeHtmlResponseOptions(options = {}) {
+  if (options == null) {
+    return {
+      status: 200,
+      headers: Object.create(null),
+      objects: null,
+    };
+  }
+
+  if (typeof options !== "object") {
+    throw new TypeError("html(options) expects an object");
+  }
+
+  return {
+    status:
+      options.status === undefined
+        ? 200
+        : Math.max(100, Math.min(599, Math.floor(Number(options.status) || 200))),
+    headers: normalizeHeaderRecord(options.headers),
+    objects: options.objects ?? null,
+  };
+}
+
+function escapeInlineScriptJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/-->/g, "--\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
+    .replace(/<\/script/gi, "<\\/script");
+}
+
+function injectHtmlObjectsScript(html, objects) {
+  if (objects == null) {
+    return String(html);
+  }
+
+  const markup = String(html);
+  const payload = escapeInlineScriptJson(objects);
+  const script =
+    `<script>window.hnSSR=window.hnSSR||{};window.hnSSR.objects=${payload};</script>`;
+  const bodyCloseMatch = /<\/body\s*>/i.exec(markup);
+
+  if (!bodyCloseMatch || bodyCloseMatch.index === undefined) {
+    return `${markup}${script}`;
+  }
+
+  return `${markup.slice(0, bodyCloseMatch.index)}${script}${markup.slice(bodyCloseMatch.index)}`;
+}
+
+function buildHtmlResponsePayload(html, options = {}) {
+  const normalized = normalizeHtmlResponseOptions(options);
+  const headers = {
+    ...normalized.headers,
+  };
+
+  if (!headers["content-type"]) {
+    headers["content-type"] = "text/html; charset=utf-8";
+  }
+
+  return {
+    status: normalized.status,
+    headers,
+    body: injectHtmlObjectsScript(html, normalized.objects),
+  };
+}
+
+function createStaticHtmlFallbackHandler(staticResponse) {
+  return (_req, res) => {
+    res.status(staticResponse.status);
+    for (const [name, value] of Object.entries(staticResponse.headers)) {
+      res.header(name, value);
+    }
+    res.send(staticResponse.body);
+  };
+}
+
 
 
 const RESPONSE_POOL_MAX = 512;
@@ -247,6 +347,22 @@ const RESPONSE_PROTO = {
     }
 
     state.body = this._jsonSerializer(data);
+    state.finished = true;
+    return this;
+  },
+
+  html(html, options = {}) {
+    const state = this._state;
+    if (state.finished) {
+      return this;
+    }
+
+    const payload = buildHtmlResponsePayload(html, options);
+    state.status = payload.status;
+    for (const [name, value] of Object.entries(payload.headers)) {
+      state.headers[name] = value;
+    }
+    state.body = Buffer.from(payload.body, "utf8");
     state.finished = true;
     return this;
   },
@@ -791,6 +907,28 @@ function normalizeRouteRegistration(method, path, handler, options = {}) {
   };
 }
 
+function normalizeStaticRouteRegistration(path, html, options = {}) {
+  if (typeof html !== "string") {
+    throw new TypeError("app.static(path, html, options) expects html to be a string");
+  }
+
+  const normalizedPath = normalizeRoutePath("GET", path);
+  if (normalizedPath.includes(":")) {
+    throw new Error("app.static() only supports exact GET paths without params");
+  }
+
+  const staticResponse = buildHtmlResponsePayload(html, options);
+  return {
+    method: "GET",
+    path: normalizedPath,
+    handler: createStaticHtmlFallbackHandler(staticResponse),
+    cache: null,
+    staticResponse,
+    sourceLocation: options.sourceLocation ?? null,
+    syntheticHandlerSource: "(req, res) => res.html(\"<static>\")",
+  };
+}
+
 function captureRouteRegistrationLocation() {
   const stack = new Error().stack;
   if (!stack) {
@@ -852,6 +990,10 @@ function compileMiddlewareRegistration(middleware) {
 }
 
 function createRouteResponseCache(route, applicableMiddlewares, requestPlan, optConfig) {
+  if (route.staticResponse) {
+    return null;
+  }
+
   if (optConfig?.cache !== true) {
     return null;
   }
@@ -1405,10 +1547,15 @@ function buildCompiledApplication(app, normalizedOptions) {
   );
 
   const routes = app._routes.map((route) => {
-    let handlerSource = Function.prototype.toString.call(route.handler);
-    const probedSource = probeHandlerForFastPath(route, handlerSource);
-    if (probedSource) {
-      handlerSource = probedSource;
+    let handlerSource =
+      route.syntheticHandlerSource ??
+      Function.prototype.toString.call(route.handler);
+
+    if (!route.staticResponse) {
+      const probedSource = probeHandlerForFastPath(route, handlerSource);
+      if (probedSource) {
+        handlerSource = probedSource;
+      }
     }
 
     return {
@@ -1418,6 +1565,22 @@ function buildCompiledApplication(app, normalizedOptions) {
       ...compileRouteShape(route.method, route.path),
     };
   });
+
+  for (const route of routes) {
+    if (!route.staticResponse) {
+      continue;
+    }
+
+    const hasMiddleware = compiledMiddlewares.some((middleware) =>
+      pathPrefixMatches(middleware.pathPrefix, route.path),
+    );
+    if (hasMiddleware) {
+      throw new Error(
+        `app.static(${JSON.stringify(route.path)}) cannot be used with applicable middleware`,
+      );
+    }
+  }
+
   const compiledRoutes = routes.map((route) =>
     compileRouteDispatch(
       route,
@@ -1455,6 +1618,13 @@ function buildCompiledApplication(app, normalizedOptions) {
         route.requestPlan.queryKeys.size > 0,
       cache: normalizeManifestCache(route.cache),
       needsSession: /\breq\.session\b|\breq\.sessionId\b/.test(route.handlerSource),
+      staticResponse: route.staticResponse
+        ? {
+          status: route.staticResponse.status,
+          headers: route.staticResponse.headers,
+          body: route.staticResponse.body,
+        }
+        : null,
     })),
     wsRoutes: app._wsRoutes.map((ws) => ({
       path: ws.path,
@@ -1748,6 +1918,7 @@ export function createApp(config = {}) {
     patch: undefined,
     options: undefined,
     all: undefined,
+    static: undefined,
 
     reload(options = {}) {
       this._reloadConfig = normalizeApplicationReloadConfig(options);
@@ -1934,6 +2105,23 @@ export function createApp(config = {}) {
   app.patch = createMethodRegistrar(app, "PATCH");
   app.options = createMethodRegistrar(app, "OPTIONS");
   app.all = createMethodRegistrar(app, "ALL");
+  app.static = (routePath, html, options = {}) => {
+    const groupPrefix = app._groupPrefix ?? "/";
+    const scopedPath =
+      typeof routePath === "string"
+        ? applyGroupPrefixToRoutePath(routePath, groupPrefix)
+        : routePath;
+    const sourceLocation = captureRouteRegistrationLocation();
+    const routeOptions = sourceLocation
+      ? { ...options, sourceLocation }
+      : options;
+
+    app._routes.push({
+      ...normalizeStaticRouteRegistration(scopedPath, html, routeOptions),
+      handlerId: app._allocateHandlerId(),
+    });
+    return app;
+  };
 
   return app;
 }

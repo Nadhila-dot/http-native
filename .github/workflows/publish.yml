@@ -98,10 +98,6 @@ jobs:
             platform: win32
             arch: x64
             source: target/release/http_native_napi.dll
-          - os: macos-13
-            platform: darwin
-            arch: x64
-            source: target/release/libhttp_native_napi.dylib
           - os: macos-14
             platform: darwin
             arch: arm64

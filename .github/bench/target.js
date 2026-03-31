@@ -114,19 +114,20 @@ function startBunServer(label, activeScenario) {
 }
 
 async function startFrameworkServer(createApp, label, activeScenario) {
+  const shouldEnableOptConfig =
+    label === "http-native" && activeScenario === "opt";
+  const createConfiguredApp = () =>
+    shouldEnableOptConfig ? createApp({ dev: { cache: true } }) : createApp();
+
   const app =
     activeScenario === "static"
-      ? buildStaticApp(createApp, label)
+      ? buildStaticApp(createConfiguredApp, label)
       : activeScenario === "dynamic"
-        ? buildDynamicApp(createApp, label)
-        : buildOptimizedApp(createApp, label);
+        ? buildDynamicApp(createConfiguredApp, label)
+        : buildOptimizedApp(createConfiguredApp, label);
 
   const server = await app.listen({
     port,
-    opt:
-      label === "http-native" && activeScenario === "opt"
-        ? { notify: true, cache: true }
-        : undefined,
   });
 
   let optimizationReporter = null;

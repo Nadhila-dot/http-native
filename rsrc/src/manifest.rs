@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +103,8 @@ pub struct RouteInput {
     pub needs_session: bool,
     #[serde(default)]
     pub cache: Option<CacheConfigInput>,
+    #[serde(default)]
+    pub static_response: Option<StaticResponseInput>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +120,15 @@ pub struct CacheConfigInput {
 pub struct CacheVaryInput {
     pub source: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticResponseInput {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

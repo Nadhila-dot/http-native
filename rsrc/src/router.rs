@@ -10,7 +10,7 @@ use crate::analyzer::{
     analyze_dynamic_fast_path, analyze_route, normalize_path, parse_segments, AnalysisResult,
     DynamicFastPathSpec, RouteSegment,
 };
-use crate::manifest::{ManifestInput, MiddlewareInput, RouteInput};
+use crate::manifest::{ManifestInput, MiddlewareInput, RouteInput, StaticResponseInput};
 
 const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
@@ -216,6 +216,25 @@ impl Router {
         for route in &manifest.routes {
             let method = route.method.to_uppercase();
             let path = normalize_path(route.path.as_str());
+            if let Some(static_response) = route.static_response.as_ref() {
+                let Some(method_key) = MethodKey::from_method_str(method.as_str()) else {
+                    continue;
+                };
+
+                let exact_route = build_exact_static_route(static_response);
+
+                if method_key == MethodKey::Get && path == "/" {
+                    exact_get_root = Some(exact_route);
+                    continue;
+                }
+
+                exact_static_routes
+                    .entry(method_key)
+                    .or_insert_with(HashMap::new)
+                    .insert(Box::<[u8]>::from(path.as_bytes()), exact_route);
+                continue;
+            }
+
             if let AnalysisResult::ExactStaticFastPath(spec) =
                 analyze_route(route, &manifest.middlewares)
             {
@@ -466,6 +485,22 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
         needs_query: route.needs_query,
         fast_path: analyze_dynamic_fast_path(route, middlewares),
         cache_config,
+    }
+}
+
+fn build_exact_static_route(static_response: &StaticResponseInput) -> ExactStaticRoute {
+    let body = static_response.body.as_bytes();
+    ExactStaticRoute {
+        close_response: Bytes::from(build_close_response(
+            static_response.status,
+            &static_response.headers,
+            body,
+        )),
+        keep_alive_response: Bytes::from(build_keep_alive_response(
+            static_response.status,
+            &static_response.headers,
+            body,
+        )),
     }
 }
 

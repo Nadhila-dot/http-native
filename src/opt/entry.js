@@ -5,7 +5,9 @@ export function buildRouteEntry(route, middlewares) {
   );
   const source = route.handlerSource ?? "";
   const nativeCache = source.includes("res.ncache(");
-  const staticFastPath = !nativeCache && isStaticFastPathCandidate(route, hasMiddleware, source);
+  const staticFastPath =
+    route.staticResponse != null ||
+    (!nativeCache && isStaticFastPathCandidate(route, hasMiddleware, source));
   const cacheCandidate =
     !staticFastPath &&
     route.method === "GET" &&

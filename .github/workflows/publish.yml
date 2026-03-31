@@ -137,13 +137,10 @@ jobs:
           path: dist/native/http-native-${{ matrix.platform }}-${{ matrix.arch }}.node
           if-no-files-found: error
 
-      - name: Resolve release tag
-        run: echo "RELEASE_TAG=${{ needs.prepare-version.outputs.tag }}" >> "$GITHUB_ENV"
-
       - name: Upload release binary
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
+          tag_name: ${{ needs.prepare-version.outputs.tag }}
           files: dist/native/http-native-${{ matrix.platform }}-${{ matrix.arch }}.node
 
   publish-npm:

@@ -42,8 +42,8 @@ export function resolvePackageVersion(explicitVersion) {
     return String(explicitVersion);
   }
 
-  if (process.env.npm_package_version) {
-    return process.env.npm_package_version;
+  if (process.env.HTTP_NATIVE_BINARY_VERSION) {
+    return process.env.HTTP_NATIVE_BINARY_VERSION;
   }
 
   return String(readPackageJson().version);

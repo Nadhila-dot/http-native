@@ -1,5 +1,6 @@
 mod analyzer;
 mod manifest;
+mod rate_limit;
 mod router;
 pub mod session;
 mod websocket;
@@ -44,7 +45,7 @@ const FALLBACK_HOT_GET_ROOT_HTTP10: &str = "GET / HTTP/1.0\r\n";
 const FALLBACK_HEADER_CONNECTION_PREFIX: &str = "connection:";
 const FALLBACK_HEADER_CONTENT_LENGTH_PREFIX: &str = "content-length:";
 const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
-const BRIDGE_VERSION: u8 = 1;
+const BRIDGE_VERSION: u8 = 2;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
 const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
 const UNKNOWN_METHOD_CODE: u8 = 0;
@@ -503,6 +504,73 @@ pub fn session_set_all(session_id_hex: String, data_json: String) -> bool {
     true
 }
 
+#[napi(object)]
+pub struct NativeRateLimitResult {
+    pub allowed: bool,
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset_at_ms: f64,
+    pub retry_after_secs: f64,
+    pub now_ms: f64,
+}
+
+/// Low-level sliding-window rate-limit check.
+/// Namespace and key are fully caller-defined so policy can be composed in JS.
+#[napi]
+pub fn rate_limit_check(
+    namespace: String,
+    key: String,
+    max: u32,
+    window_secs: u32,
+    cost: Option<u32>,
+) -> napi::Result<NativeRateLimitResult> {
+    if namespace.trim().is_empty() {
+        return Err(to_napi_error(anyhow!("rateLimitCheck: namespace must be non-empty")));
+    }
+    if key.trim().is_empty() {
+        return Err(to_napi_error(anyhow!("rateLimitCheck: key must be non-empty")));
+    }
+    if max == 0 {
+        return Err(to_napi_error(anyhow!("rateLimitCheck: max must be greater than 0")));
+    }
+    if window_secs == 0 {
+        return Err(to_napi_error(anyhow!(
+            "rateLimitCheck: windowSecs must be greater than 0"
+        )));
+    }
+
+    let decision = rate_limit::check(
+        &namespace,
+        &key,
+        max,
+        window_secs,
+        cost.unwrap_or(1).max(1),
+        rate_limit::now_ms(),
+    );
+
+    Ok(NativeRateLimitResult {
+        allowed: decision.allowed,
+        limit: decision.limit,
+        remaining: decision.remaining,
+        reset_at_ms: decision.reset_at_ms as f64,
+        retry_after_secs: decision.retry_after_secs as f64,
+        now_ms: decision.now_ms as f64,
+    })
+}
+
+/// Reset low-level limiter state.
+/// - no args: clear all namespaces
+/// - namespace only: clear a namespace
+/// - namespace + key: clear one key
+#[napi]
+pub fn rate_limit_reset(namespace: Option<String>, key: Option<String>) -> u32 {
+    if namespace.is_none() && key.is_some() {
+        return 0;
+    }
+
+    rate_limit::reset(namespace.as_deref(), key.as_deref()) as u32
+}
+
 #[napi]
 pub fn start_server(
     manifest_json: String,
@@ -725,7 +793,7 @@ async fn run_server(
         }
 
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, peer_addr)) => {
                 if shutdown_flag.load(Ordering::Acquire) {
                     break;
                 }
@@ -760,14 +828,22 @@ async fn run_server(
                                     dispatcher,
                                     server_config,
                                     session_store,
+                                    Some(peer_addr),
                                 )
                                 .await
                             }
                             Err(error) => Err(anyhow!("TLS accept failed: {error}")),
                         }
                     } else {
-                        handle_connection(stream, live_router, dispatcher, server_config, session_store)
-                            .await
+                        handle_connection(
+                            stream,
+                            live_router,
+                            dispatcher,
+                            server_config,
+                            session_store,
+                            Some(peer_addr),
+                        )
+                        .await
                     };
                     if let Err(error) = connection_result {
                         eprintln!("[http-native] connection error: {error}");
@@ -828,11 +904,13 @@ async fn handle_connection<S>(
     dispatcher: Rc<Arc<JsDispatcher>>,
     server_config: Rc<Arc<HttpServerConfig>>,
     session_store: Option<Rc<Arc<session::SessionStore>>>,
+    peer_addr: Option<SocketAddr>,
 ) -> Result<()>
 where
     S: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     let mut buffer = acquire_buffer();
+    let peer_ip = peer_addr.map(|addr| addr.ip().to_string());
 
     let result = handle_connection_inner(
         &mut stream,
@@ -840,6 +918,7 @@ where
         live_router.as_ref().as_ref(),
         &dispatcher,
         &server_config,
+        peer_ip.as_deref(),
         session_store.as_deref().map(|arc| arc.as_ref()),
     )
     .await;
@@ -854,6 +933,7 @@ async fn handle_connection_inner<S>(
     live_router: &LiveRouter,
     dispatcher: &JsDispatcher,
     server_config: &HttpServerConfig,
+    peer_ip: Option<&str>,
     session_store: Option<&session::SessionStore>,
 ) -> Result<()>
 where
@@ -994,7 +1074,8 @@ where
         // Build dispatch envelope directly from borrowed parse data, avoiding
         // String/Vec allocations for method, target, path, and headers.
         if !has_body {
-            let dispatch_decision = build_dispatch_decision_zero_copy(router.as_ref(), &parsed, &[])?;
+            let dispatch_decision =
+                build_dispatch_decision_zero_copy(router.as_ref(), &parsed, &[], peer_ip)?;
 
             // Extract session before dropping parsed
             let (session_id, is_new_session) = resolve_session(session_store, parsed.cookie_header);
@@ -1102,6 +1183,7 @@ where
             &path_owned,
             &headers_owned,
             &body_bytes,
+            peer_ip,
         )?;
 
         match dispatch_decision_owned {
@@ -1342,6 +1424,7 @@ fn build_dispatch_decision_zero_copy(
     router: &Router,
     parsed: &ParsedRequest<'_>,
     body: &[u8],
+    peer_ip: Option<&str>,
 ) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
     let path_cow = String::from_utf8_lossy(parsed.path);
@@ -1357,6 +1440,7 @@ fn build_dispatch_decision_zero_copy(
             url_str,
             &parsed.headers,
             body,
+            peer_ip,
         )
         .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     }
@@ -1374,6 +1458,7 @@ fn build_dispatch_decision_zero_copy(
             url_str,
             &parsed.headers,
             body,
+            peer_ip,
         )
         .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     };
@@ -1409,6 +1494,7 @@ fn build_dispatch_decision_zero_copy(
         url_str,
         &parsed.headers,
         body,
+        peer_ip,
     )
     .map(|envelope| DispatchDecision::BridgeRequest(
         envelope,
@@ -1426,6 +1512,7 @@ fn build_dispatch_decision_owned(
     path: &[u8],
     headers: &[(String, String)],
     body: &[u8],
+    peer_ip: Option<&str>,
 ) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(method).unwrap_or(UNKNOWN_METHOD_CODE);
 
@@ -1448,6 +1535,7 @@ fn build_dispatch_decision_owned(
             url_str,
             &header_refs,
             body,
+            peer_ip,
         )
         .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     }
@@ -1465,6 +1553,7 @@ fn build_dispatch_decision_owned(
             url_str,
             &header_refs,
             body,
+            peer_ip,
         )
         .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     };
@@ -1505,6 +1594,7 @@ fn build_dispatch_decision_owned(
         url_str,
         &header_refs,
         body,
+        peer_ip,
     )
     .map(|envelope| DispatchDecision::BridgeRequest(
         envelope,
@@ -1521,6 +1611,7 @@ fn build_not_found_dispatch_envelope(
     url: &str,
     header_entries: &[(&str, &str)],
     body: &[u8],
+    peer_ip: Option<&str>,
 ) -> Result<Buffer> {
     let url_bytes = url.as_bytes();
     let path_bytes = path.as_bytes();
@@ -1542,8 +1633,13 @@ fn build_not_found_dispatch_envelope(
         return Err(anyhow!("too many headers"));
     }
 
+    let ip_bytes = peer_ip.unwrap_or("").as_bytes();
+    if ip_bytes.len() > u16::MAX as usize {
+        return Err(anyhow!("request ip too large"));
+    }
+
     let mut frame = Vec::with_capacity(
-        20 + url_bytes.len() + path_bytes.len() + header_entries.len() * 16 + body.len(),
+        22 + url_bytes.len() + path_bytes.len() + ip_bytes.len() + header_entries.len() * 16 + body.len(),
     );
     frame.push(BRIDGE_VERSION);
     frame.push(method_code);
@@ -1554,8 +1650,10 @@ fn build_not_found_dispatch_envelope(
     push_u16(&mut frame, 0);
     push_u16(&mut frame, header_entries.len() as u16);
     push_u32(&mut frame, body.len() as u32);
+    push_u16(&mut frame, ip_bytes.len() as u16);
     frame.extend_from_slice(url_bytes);
     frame.extend_from_slice(path_bytes);
+    frame.extend_from_slice(ip_bytes);
 
     for (name, value) in header_entries {
         push_string_pair(&mut frame, name, value)?;
@@ -1572,6 +1670,7 @@ fn build_dispatch_envelope(
     url: &str,
     header_entries: &[(&str, &str)],
     body: &[u8],
+    peer_ip: Option<&str>,
 ) -> Result<Buffer> {
     let include_url = matched_route.needs_url || matched_route.needs_query;
     let include_path = matched_route.needs_path;
@@ -1599,8 +1698,18 @@ fn build_dispatch_envelope(
         return Err(anyhow!("too many headers"));
     }
 
+    let ip_bytes = peer_ip.unwrap_or("").as_bytes();
+    if ip_bytes.len() > u16::MAX as usize {
+        return Err(anyhow!("request ip too large"));
+    }
+
     let mut frame = Vec::with_capacity(
-        20 + url_bytes.len() + path_bytes.len() + selected_header_count * 16 + body.len(),
+        22
+            + url_bytes.len()
+            + path_bytes.len()
+            + ip_bytes.len()
+            + selected_header_count * 16
+            + body.len(),
     );
     frame.push(BRIDGE_VERSION);
     frame.push(method_code);
@@ -1610,9 +1719,11 @@ fn build_dispatch_envelope(
     push_u16(&mut frame, path_bytes.len() as u16);
     push_u16(&mut frame, matched_route.param_values.len() as u16);
     push_u16(&mut frame, selected_header_count as u16);
-    push_u32(&mut frame, body.len() as u32); // NEW: body length
+    push_u32(&mut frame, body.len() as u32);
+    push_u16(&mut frame, ip_bytes.len() as u16);
     frame.extend_from_slice(url_bytes);
     frame.extend_from_slice(path_bytes);
+    frame.extend_from_slice(ip_bytes);
 
     for value in matched_route.param_values.iter() {
         push_string_value(&mut frame, value)?;
@@ -1626,7 +1737,7 @@ fn build_dispatch_envelope(
         }
     }
 
-    frame.extend_from_slice(body); // NEW: body bytes at end
+    frame.extend_from_slice(body);
 
     Ok(Buffer::from(frame))
 }

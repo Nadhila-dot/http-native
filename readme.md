@@ -49,6 +49,7 @@ import { createApp } from "@http-native/core";
 import { cors } from "@http-native/core/cors";
 import { validate } from "@http-native/core/validate";
 import { session } from "@http-native/core/session";
+import { rateLimit, createNativeRateLimiter } from "@http-native/core/rate-limit";
 import { createDevServer } from "@http-native/core/dev";
 import httpServerConfig from "@http-native/core/http-server.config";
 ```
@@ -101,6 +102,31 @@ app.post("/users", validate({ body: schema }), async (req, res) => {
   // req.validatedBody is the parsed and validated body
   res.status(201).json(req.validatedBody);
 });
+```
+
+## Rate Limiting
+
+```js
+import { rateLimit } from "@http-native/core/rate-limit";
+
+app.use("/api", rateLimit({
+  max: 100,
+  window: 60,
+}));
+```
+
+Low-level native handle:
+
+```js
+import { createNativeRateLimiter } from "@http-native/core/rate-limit";
+
+const limiter = createNativeRateLimiter({
+  namespace: "auth-login",
+  max: 5,
+  window: 60,
+});
+
+const decision = limiter.check("127.0.0.1");
 ```
 
 ## Static Routes

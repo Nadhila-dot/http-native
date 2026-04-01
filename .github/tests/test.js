@@ -4,6 +4,7 @@ import net from "node:net";
 
 import httpServerConfig from "../../src/http-server.config.js";
 import { createApp } from "../../src/index.js";
+import { createNativeRateLimiter, rateLimit } from "../../src/rate-limit.js";
 
 const stablePayload = {
   ok: true,
@@ -121,6 +122,19 @@ async function main() {
   const chainOrder = [];
   const observedErrors = [];
 
+  const lowLevelLimiter = createNativeRateLimiter({
+    namespace: "test-low-level-rate-limit",
+    max: 2,
+    window: 60,
+  });
+  const firstLowLevel = lowLevelLimiter.check("127.0.0.1");
+  const secondLowLevel = lowLevelLimiter.check("127.0.0.1");
+  const thirdLowLevel = lowLevelLimiter.check("127.0.0.1");
+  assert.equal(firstLowLevel.allowed, true);
+  assert.equal(secondLowLevel.allowed, true);
+  assert.equal(thirdLowLevel.allowed, false);
+  lowLevelLimiter.clear();
+
   const app = createApp();
   assert.equal(typeof app.error, "function");
 
@@ -173,6 +187,28 @@ async function main() {
     res.header("x-powered-by", "http-native");
     await next();
   });
+  app.use("/limited", rateLimit({
+    namespace: "test-rate-limit-global",
+    max: 2,
+    window: 60,
+  }));
+  app.use("/token-limited", rateLimit({
+    namespace: "test-rate-limit-token",
+    max: 1,
+    window: 60,
+    key(req) {
+      return String(req.query.token ?? req.ip);
+    },
+    headers: {
+      limit: "ratelimit-limit",
+      remaining: "ratelimit-remaining",
+      reset: "ratelimit-reset",
+      retryAfter: "retry-after",
+    },
+    message: {
+      error: "Slow down",
+    },
+  }));
   app.get("/", (req, res) => {
     res.json({
       ok: true,
@@ -200,6 +236,15 @@ async function main() {
   );
   app.get("/stable", (req, res) => {
     res.json(stablePayload);
+  });
+  app.get("/ip", (req, res) => {
+    res.json({ ip: req.ip });
+  });
+  app.get("/limited", (_req, res) => {
+    res.json({ ok: true });
+  });
+  app.get("/token-limited", (req, res) => {
+    res.json({ token: req.query.token ?? null });
   });
   app.get("/html-helper", (_req, res) => {
     res.html("<html><body><main>helper</main></body></html>", {
@@ -313,6 +358,45 @@ async function main() {
       ok: true,
       engine: "rust",
     });
+
+    const limitedFirst = await fetch(new URL("/limited", server.url));
+    assert.equal(limitedFirst.status, 200);
+    assert.equal(limitedFirst.headers.get("x-ratelimit-limit"), "2");
+    assert.equal(limitedFirst.headers.get("x-ratelimit-remaining"), "1");
+
+    const limitedSecond = await fetch(new URL("/limited", server.url));
+    assert.equal(limitedSecond.status, 200);
+    assert.equal(limitedSecond.headers.get("x-ratelimit-limit"), "2");
+    assert.equal(limitedSecond.headers.get("x-ratelimit-remaining"), "0");
+
+    const limitedThird = await fetch(new URL("/limited", server.url));
+    assert.equal(limitedThird.status, 429);
+    assert.equal(limitedThird.headers.get("x-ratelimit-limit"), "2");
+    assert.equal(limitedThird.headers.get("x-ratelimit-remaining"), "0");
+    assert.ok(Number(limitedThird.headers.get("retry-after")) >= 1);
+    const limitedThirdBody = await limitedThird.json();
+    assert.equal(limitedThirdBody.error, "Too Many Requests");
+
+    const tokenFirst = await fetch(new URL("/token-limited?token=a", server.url));
+    assert.equal(tokenFirst.status, 200);
+    assert.equal(tokenFirst.headers.get("ratelimit-limit"), "1");
+    assert.equal(tokenFirst.headers.get("ratelimit-remaining"), "0");
+
+    const tokenSecond = await fetch(new URL("/token-limited?token=a", server.url));
+    assert.equal(tokenSecond.status, 429);
+    assert.equal(tokenSecond.headers.get("ratelimit-limit"), "1");
+    assert.equal(tokenSecond.headers.get("ratelimit-remaining"), "0");
+    const tokenSecondBody = await tokenSecond.json();
+    assert.equal(tokenSecondBody.error, "Slow down");
+
+    const tokenOther = await fetch(new URL("/token-limited?token=b", server.url));
+    assert.equal(tokenOther.status, 200);
+
+    const ipResponse = await fetch(new URL("/ip", server.url));
+    assert.equal(ipResponse.status, 200);
+    const ipPayload = await ipResponse.json();
+    assert.equal(typeof ipPayload.ip, "string");
+    assert.ok(ipPayload.ip.length > 0);
 
     const ssrResponse = await fetch(new URL("/ssr", server.url));
     assert.equal(ssrResponse.status, 200);

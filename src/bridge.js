@@ -7,7 +7,7 @@ const EMPTY_ARRAY = Object.freeze([]);
 const HEADER_LOOKUP_CACHE_MAX = 128;
 const headerLookupNameCache = new Map();
 
-export const BRIDGE_VERSION = 1;
+export const BRIDGE_VERSION = 2;
 export const REQUEST_FLAG_QUERY_PRESENT = 1 << 0;
 export const REQUEST_FLAG_BODY_PRESENT = 1 << 1;
 
@@ -232,6 +232,7 @@ export function releaseRequestObject(req) {
   req.method = "";
   req._path = undefined;
   req._url = undefined;
+  req._ip = undefined;
   req._params = undefined;
   req._query = undefined;
   req._headers = undefined;
@@ -252,6 +253,7 @@ function createPooledRequest() {
   // Internal state
   req._path = undefined;
   req._url = undefined;
+  req._ip = undefined;
   req._params = undefined;
   req._query = undefined;
   req._headers = undefined;
@@ -282,6 +284,17 @@ function createPooledRequest() {
         req._url = textDecoder.decode(req._decoded.urlBytes);
       }
       return req._url;
+    },
+  });
+
+  Object.defineProperty(req, "ip", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (req._ip === undefined) {
+        req._ip = textDecoder.decode(req._decoded.ipBytes);
+      }
+      return req._ip;
     },
   });
 
@@ -451,6 +464,7 @@ export function createRequestFactory(
     request.method = routeMethod ?? methodNameFromCode(decoded.methodCode);
     request._path = undefined;
     request._url = undefined;
+    request._ip = undefined;
     request._params = undefined;
     request._query = undefined;
     request._headers = undefined;
@@ -486,7 +500,7 @@ export function createJsonSerializer(mode = "fallback") {
  * Decode a binary request envelope produced by the Rust native layer.
  * Layout (little-endian): version(1) | methodCode(1) | flags(2) |
  * handlerId(4) | urlLen(4) | pathLen(2) | paramCount(2) |
- * headerCount(2) | bodyLen(4) | url | path | params… | headers… | body
+ * headerCount(2) | bodyLen(4) | ipLen(2) | url | path | ip | params… | headers… | body
  *
  * @param {Buffer|Uint8Array} buffer - Raw envelope bytes from Rust
  * @returns {Object} Decoded envelope with handlerId, flags, methodCode, etc.
@@ -519,11 +533,15 @@ export function decodeRequestEnvelope(buffer) {
 
   const bodyLength = readU32(bytes, offset);
   offset += 4;
+  const ipLength = readU16(bytes, offset);
+  offset += 2;
 
   const urlBytes = readBytes(bytes, offset, urlLength);
   offset += urlLength;
   const pathBytes = readBytes(bytes, offset, pathLength);
   offset += pathLength;
+  const ipBytes = readBytes(bytes, offset, ipLength);
+  offset += ipLength;
 
   const paramValues = paramCount === 0 ? EMPTY_ARRAY : new Array(paramCount);
   for (let index = 0; index < paramCount; index += 1) {
@@ -572,6 +590,7 @@ export function decodeRequestEnvelope(buffer) {
     methodCode,
     urlBytes,
     pathBytes,
+    ipBytes,
     paramValues,
     rawHeaders,
     bodyBytes,

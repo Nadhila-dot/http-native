@@ -15,6 +15,9 @@ export interface Request {
   /** Full request URL including query string */
   readonly url: string;
 
+  /** Client IP address from the native connection peer */
+  readonly ip: string;
+
   /** Route parameters extracted from path segments (e.g., /users/:id → { id: "42" }) */
   readonly params: Record<string, string>;
 
@@ -432,3 +435,65 @@ export interface ValidateOptions<TBody = unknown, TQuery = unknown, TParams = un
 export function validate<TBody = unknown, TQuery = unknown, TParams = unknown>(
   schema: ValidateOptions<TBody, TQuery, TParams>,
 ): Middleware;
+
+// ─── Rate Limit Types ───────────────────
+
+export interface NativeRateLimitDecision {
+  allowed: boolean;
+  limit: number;
+  remaining: number;
+  resetAtMs: number;
+  retryAfterSecs: number;
+  nowMs: number;
+}
+
+export interface NativeRateLimiterOptions {
+  namespace?: string;
+  max?: number;
+  window?: number;
+  cost?: number;
+}
+
+export interface NativeRateLimiter {
+  readonly namespace: string;
+  check(
+    key: string,
+    options?: {
+      max?: number;
+      window?: number;
+      cost?: number;
+    },
+  ): NativeRateLimitDecision;
+  reset(key?: string): number;
+  clear(): number;
+}
+
+export interface RateLimitHeaderNames {
+  limit?: string;
+  remaining?: string;
+  reset?: string;
+  retryAfter?: string;
+}
+
+export interface RateLimitOptions {
+  namespace?: string;
+  max: number | ((req: Request, res: Response) => number | Promise<number>);
+  window: number | ((req: Request, res: Response) => number | Promise<number>);
+  cost?: number | ((req: Request, res: Response) => number | Promise<number>);
+  key?: (req: Request, res: Response) => string | Promise<string>;
+  skip?: boolean | ((req: Request, res: Response) => boolean | Promise<boolean>);
+  headers?: boolean | RateLimitHeaderNames;
+  statusCode?: number;
+  message?: string | Record<string, unknown>;
+  onRejected?: (
+    req: Request,
+    res: Response,
+    decision: NativeRateLimitDecision,
+  ) => void | Promise<void>;
+}
+
+/** Create a low-level native sliding-window limiter handle. */
+export function createNativeRateLimiter(options?: NativeRateLimiterOptions): NativeRateLimiter;
+
+/** Create a high-level middleware wrapper around the native limiter handle. */
+export function rateLimit(options: RateLimitOptions): Middleware;

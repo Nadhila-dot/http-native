@@ -30,6 +30,10 @@
     },
     "./hot": "./src/hot.js",
     "./session": "./src/session.js",
+    "./rate-limit": {
+      "types": "./src/rate-limit.d.ts",
+      "default": "./src/rate-limit.js"
+    },
     "./validate": "./src/validate.js",
     "./http-server.config": "./src/http-server.config.js"
   },

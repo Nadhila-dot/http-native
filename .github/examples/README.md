@@ -26,5 +26,5 @@ bun .github/examples/reload/server.js
 | **[middleware](./middleware/)** | Logging, path-scoped auth, request IDs, `res.locals` data passing |
 | **[rest-api](./rest-api/)** | Full CRUD Todo API — GET, POST, PUT, PATCH, DELETE with body parsing |
 | **[validation](./validation/)** | Request body & query validation (Zod-compatible schema interface) |
-| **[error-handling](./error-handling/)** | Custom error classes, global `onError()` handler, async error catching |
+| **[error-handling](./error-handling/)** | Custom error classes, global `error()` handler, async error catching |
 | **[reload](./reload/)** | `app.reload({...})` + `.listen().hot()` runtime reload flow |

@@ -31,7 +31,7 @@ class UnauthorizedError extends AppError {
 
 // Global error handler
 
-app.onError((err, req, res) => {
+app.error((err, req, res) => {
   // Known application errors
   if (err instanceof AppError) {
     console.error(`[${err.code}] ${req.method} ${req.path}: ${err.message}`);

@@ -61,7 +61,7 @@ const QuerySchema = createSchema((data) => {
 
 // ─── Error Handler ──────────────────────
 
-app.onError((err, req, res) => {
+app.error((err, req, res) => {
   console.error(`Error: ${err.message}`);
   res.status(500).json({ error: "Internal server error" });
 });

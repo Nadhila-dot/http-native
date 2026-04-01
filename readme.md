@@ -46,9 +46,85 @@ console.log(`Listening on ${server.url}`);
 
 ```js
 import { createApp } from "@http-native/core";
-import cors from "@http-native/core/cors";
+import { cors } from "@http-native/core/cors";
 import { validate } from "@http-native/core/validate";
+import { session } from "@http-native/core/session";
+import { createDevServer } from "@http-native/core/dev";
 import httpServerConfig from "@http-native/core/http-server.config";
+```
+
+## Middleware
+
+```js
+import { cors } from "@http-native/core/cors";
+import { session } from "@http-native/core/session";
+
+// CORS — allow all origins
+app.use(cors());
+
+// CORS — specific origins with credentials
+app.use(cors({
+  origin: ["https://myapp.com", "https://admin.myapp.com"],
+  credentials: true,
+}));
+
+// Sessions — Rust-backed in-memory store (default)
+app.use(session({ secret: "your-secret-key" }));
+```
+
+## Route Grouping
+
+```js
+app.group("/api/v1", (api) => {
+  api.get("/users", async (req, res) => {
+    res.json({ users: [] });
+  });
+
+  api.post("/users", async (req, res) => {
+    res.status(201).json({ created: true });
+  });
+});
+```
+
+## Validation
+
+```js
+import { validate } from "@http-native/core/validate";
+import { z } from "zod";
+
+const schema = z.object({
+  name: z.string(),
+  email: z.string().email(),
+});
+
+app.post("/users", validate({ body: schema }), async (req, res) => {
+  // req.validatedBody is the parsed and validated body
+  res.status(201).json(req.validatedBody);
+});
+```
+
+## Static Routes
+
+```js
+// Serve a pre-rendered HTML string from the Rust fast path,
+// bypassing the JS bridge on every request after the first.
+app.static("/about", "<html>...</html>");
+
+// With SSR object injection — window.hnSSR.objects is available in the browser
+app.static("/dashboard", html, {
+  objects: { user: { id: 1, name: "Alice" } },
+});
+```
+
+## Native Response Cache
+
+```js
+app.get("/data", async (req, res) => {
+  const data = await fetchData();
+  // Cache this JSON response in Rust for 60 seconds.
+  // Subsequent requests are served without crossing the JS bridge.
+  res.ncache(data, 60);
+});
 ```
 
 ## Optimizations
@@ -100,4 +176,13 @@ For existing self-starting apps, runtime hot reload still works:
 
 ```js
 await app.listen().hot();
+```
+
+## TLS / HTTPS
+
+```js
+const server = await app.listen().port(443).tls({
+  cert: "./cert.pem",
+  key: "./key.pem",
+});
 ```

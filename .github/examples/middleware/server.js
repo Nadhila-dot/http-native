@@ -72,7 +72,7 @@ app.get("/api/secret", (req, res) => {
 
 // ─── Error Handler ──────────────────────
 
-app.onError((err, req, res) => {
+app.error((err, req, res) => {
   console.error(`❌ Error on ${req.method} ${req.path}:`, err.message);
   res.status(500).json({
     error: "Something went wrong",

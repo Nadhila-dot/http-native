@@ -156,10 +156,49 @@ async function startFrameworkServer(createApp, label, activeScenario) {
   });
 }
 
+async function startExpressServer(activeScenario) {
+  const { default: express } = await import("express");
+  const app = express();
+
+  if (activeScenario === "static") {
+    app.get("/", (_req, res) => {
+      res.json(buildStaticPayload("express"));
+    });
+  } else if (activeScenario === "dynamic") {
+    app.get("/users/:id", (req, res) => {
+      res.json({
+        id: req.params.id,
+        engine: "express",
+        mode: "dynamic",
+      });
+    });
+  } else {
+    app.get("/stable", (_req, res) => {
+      res.json(buildOptimizedPayload("express"));
+    });
+  }
+
+  app.use((_req, res) => {
+    res.status(404).json({ error: "Route not found" });
+  });
+
+  const server = app.listen(port, "127.0.0.1", () => {
+    console.log(`READY http://127.0.0.1:${port}`);
+  });
+
+  process.on("SIGTERM", () => {
+    server.close(() => {
+      process.exit(0);
+    });
+  });
+}
+
 if (engine === "bun") {
   startBunServer("bun", scenario);
 } else if (engine === "http-native") {
   await startFrameworkServer(createHttpNativeApp, "http-native", scenario);
+} else if (engine === "express") {
+  await startExpressServer(scenario);
 } else if (engine === "old") {
   const { createApp: createOldApp } = await import("../../old/src/index.js");
   await startFrameworkServer(createOldApp, "old", scenario);

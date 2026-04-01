@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
-const DEFAULT_ENGINES = ["http-native", "bun"];
+const DEFAULT_ENGINES = ["http-native", "bun", "express"];
 const DEFAULT_SCENARIOS = ["static", "dynamic", "opt"];
 const DEFAULT_CONNECTIONS = 200;
 const DEFAULT_DURATION = "10s";
@@ -22,6 +22,7 @@ const SERVER_PORTS = Object.freeze({
   xitca: { static: 3003, dynamic: 3013, opt: 3023 },
   monoio: { static: 3004, dynamic: 3014, opt: 3024 },
   zig: { static: 3005, dynamic: 3015, opt: 3025 },
+  express: { static: 3008, dynamic: 3018, opt: 3028 },
   fiber: { static: 3009, dynamic: 3019, opt: 3029 },
 });
 
@@ -325,8 +326,18 @@ async function runBenchmarkCase(testCase, options) {
 }
 
 function spawnServer(testCase, options) {
-  if (testCase.engine === "bun" || testCase.engine === "http-native" || testCase.engine === "old") {
-    const runtime = testCase.engine === "bun" ? "bun" : options.httpNativeRuntime;
+  if (
+    testCase.engine === "bun" ||
+    testCase.engine === "http-native" ||
+    testCase.engine === "old" ||
+    testCase.engine === "express"
+  ) {
+    const runtime =
+      testCase.engine === "bun"
+        ? "bun"
+        : testCase.engine === "express"
+          ? "node"
+          : options.httpNativeRuntime;
     return spawn(runtime, [".github/bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
       cwd: process.cwd(),
       detached: process.platform !== "win32",

@@ -40,5 +40,8 @@
     "postinstall": "bun scripts/ensure-native.mjs || node scripts/ensure-native.mjs",
     "setup:native": "bun scripts/setup-native.mjs || node scripts/setup-native.mjs",
     "test": "bun run build && bun .github/tests/test.js && bun .github/tests/test-dev.js"
+  },
+  "devDependencies": {
+    "express": "^5.1.0"
   }
 }

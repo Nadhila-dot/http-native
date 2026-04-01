@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       engines:
-        description: 'Comma-separated engines to benchmark. Supported by this workflow default run: "http-native,bun"'
+        description: 'Comma-separated engines to benchmark. Supported by this workflow default run: "http-native,bun,express"'
         required: false
-        default: "http-native,bun"
+        default: "http-native,bun,express"
       scenarios:
         description: 'Comma-separated scenarios: "static,dynamic,opt"'
         required: false
@@ -117,7 +117,7 @@ jobs:
       - name: Run benchmarks (http-native on Bun + selected engines)
         run: |
           bun .github/bench/ci.js \
-            --engines="${{ inputs.engines || 'http-native,bun' }}" \
+            --engines="${{ inputs.engines || 'http-native,bun,express' }}" \
             --scenarios="${{ inputs.scenarios || 'static,dynamic,opt' }}" \
             --connections="${{ inputs.connections || '200' }}" \
             --duration="${{ inputs.duration || '10s' }}" \

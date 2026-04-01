@@ -10,7 +10,7 @@ const httpNativeRuntime = runtimeArg ?? "bun";
 
 function printUsage() {
   console.log("Usage: bun .github/bench/run.js <engine> <scenario> <port> [httpNativeRuntime]");
-  console.log("Engines: http-native | bun | fiber | xitca | monoio | zig");
+  console.log("Engines: http-native | bun | express | fiber | xitca | monoio | zig");
   console.log("Scenarios: static | dynamic | opt");
   console.log("httpNativeRuntime: bun | node (only applies to http-native and old)");
   console.log("");
@@ -33,7 +33,7 @@ function benchmarkPathForScenario(activeScenario) {
 }
 
 async function main() {
-  if (!["http-native", "bun", "fiber", "xitca", "monoio", "zig"].includes(engine)) {
+  if (!["http-native", "bun", "express", "fiber", "xitca", "monoio", "zig"].includes(engine)) {
     printUsage();
     process.exit(1);
   }
@@ -48,7 +48,12 @@ async function main() {
     process.exit(1);
   }
 
-  const targetRuntime = engine === "http-native" || engine === "old" ? httpNativeRuntime : "bun";
+  const targetRuntime =
+    engine === "http-native" || engine === "old"
+      ? httpNativeRuntime
+      : engine === "express"
+        ? "node"
+        : "bun";
 
   const child =
     engine === "xitca" || engine === "monoio"

@@ -35,6 +35,10 @@ pub struct Router {
 pub struct ExactStaticRoute {
     pub close_response: Bytes,
     pub keep_alive_response: Bytes,
+    pub close_response_br: Option<Bytes>,
+    pub keep_alive_response_br: Option<Bytes>,
+    pub close_response_gzip: Option<Bytes>,
+    pub keep_alive_response_gzip: Option<Bytes>,
 }
 
 pub struct MatchedRoute<'a, 'b> {
@@ -207,7 +211,7 @@ impl RadixNode {
 // ─── Router Implementation ──────────────
 
 impl Router {
-    pub fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
+    pub fn from_manifest(manifest: &ManifestInput, compression_config: Option<&crate::compress::CompressionConfig>) -> Result<Self> {
         let mut exact_get_root = None;
         let mut dynamic_exact_routes = HashMap::new();
         let mut exact_static_routes = HashMap::new();
@@ -221,7 +225,7 @@ impl Router {
                     continue;
                 };
 
-                let exact_route = build_exact_static_route(static_response);
+                let exact_route = build_exact_static_route(static_response, compression_config);
 
                 if method_key == MethodKey::Get && path == "/" {
                     exact_get_root = Some(exact_route);
@@ -242,18 +246,9 @@ impl Router {
                     continue;
                 };
 
-                let exact_route = ExactStaticRoute {
-                    close_response: Bytes::from(build_close_response(
-                        spec.status,
-                        &spec.headers,
-                        &spec.body,
-                    )),
-                    keep_alive_response: Bytes::from(build_keep_alive_response(
-                        spec.status,
-                        &spec.headers,
-                        &spec.body,
-                    )),
-                };
+                let exact_route = build_exact_static_route_from_spec(
+                    spec.status, &spec.headers, &spec.body, compression_config,
+                );
 
                 if method_key == MethodKey::Get && path == "/" {
                     exact_get_root = Some(exact_route);
@@ -488,19 +483,162 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
     }
 }
 
-fn build_exact_static_route(static_response: &StaticResponseInput) -> ExactStaticRoute {
+fn build_exact_static_route(
+    static_response: &StaticResponseInput,
+    compression_config: Option<&crate::compress::CompressionConfig>,
+) -> ExactStaticRoute {
     let body = static_response.body.as_bytes();
+
+    let identity_close = build_close_response(static_response.status, &static_response.headers, body);
+    let identity_ka = build_keep_alive_response(static_response.status, &static_response.headers, body);
+
+    // Pre-compress if compression is configured and the body qualifies
+    let content_type: Option<&[u8]> = static_response.headers.get("content-type").map(|v| v.as_bytes());
+    let has_content_encoding = static_response.headers.contains_key("content-encoding");
+
+    let (br_close, br_ka, gz_close, gz_ka) = match compression_config {
+        Some(config) if !has_content_encoding => {
+            let br = crate::compress::should_compress(
+                config, crate::compress::AcceptedEncoding::Brotli, body.len(), content_type, false,
+            ).and_then(|_| crate::compress::compress_body(body, crate::compress::AcceptedEncoding::Brotli, config, content_type));
+
+            let gz = crate::compress::should_compress(
+                config, crate::compress::AcceptedEncoding::Gzip, body.len(), content_type, false,
+            ).and_then(|_| crate::compress::compress_body(body, crate::compress::AcceptedEncoding::Gzip, config, content_type));
+
+            let br_variants = br.map(|compressed_body| {
+                let close = build_compressed_response_bytes(
+                    static_response.status, &static_response.headers, &compressed_body, false,
+                    crate::compress::AcceptedEncoding::Brotli,
+                );
+                let ka = build_compressed_response_bytes(
+                    static_response.status, &static_response.headers, &compressed_body, true,
+                    crate::compress::AcceptedEncoding::Brotli,
+                );
+                (Bytes::from(close), Bytes::from(ka))
+            });
+
+            let gz_variants = gz.map(|compressed_body| {
+                let close = build_compressed_response_bytes(
+                    static_response.status, &static_response.headers, &compressed_body, false,
+                    crate::compress::AcceptedEncoding::Gzip,
+                );
+                let ka = build_compressed_response_bytes(
+                    static_response.status, &static_response.headers, &compressed_body, true,
+                    crate::compress::AcceptedEncoding::Gzip,
+                );
+                (Bytes::from(close), Bytes::from(ka))
+            });
+
+            (
+                br_variants.as_ref().map(|(c, _)| c.clone()),
+                br_variants.map(|(_, k)| k),
+                gz_variants.as_ref().map(|(c, _)| c.clone()),
+                gz_variants.map(|(_, k)| k),
+            )
+        }
+        _ => (None, None, None, None),
+    };
+
     ExactStaticRoute {
-        close_response: Bytes::from(build_close_response(
-            static_response.status,
-            &static_response.headers,
-            body,
-        )),
-        keep_alive_response: Bytes::from(build_keep_alive_response(
-            static_response.status,
-            &static_response.headers,
-            body,
-        )),
+        close_response: Bytes::from(identity_close),
+        keep_alive_response: Bytes::from(identity_ka),
+        close_response_br: br_close,
+        keep_alive_response_br: br_ka,
+        close_response_gzip: gz_close,
+        keep_alive_response_gzip: gz_ka,
+    }
+}
+
+fn build_compressed_response_bytes(
+    status: u16,
+    headers: &HashMap<String, String>,
+    compressed_body: &[u8],
+    keep_alive: bool,
+    encoding: crate::compress::AcceptedEncoding,
+) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {} {}\r\ncontent-length: {}\r\nconnection: {}\r\ncontent-encoding: {}\r\nvary: accept-encoding\r\n",
+        status,
+        status_reason(status),
+        compressed_body.len(),
+        if keep_alive { "keep-alive" } else { "close" },
+        std::str::from_utf8(crate::compress::encoding_header_value(encoding)).unwrap_or("identity"),
+    )
+    .into_bytes();
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("content-encoding")
+        {
+            continue;
+        }
+        if name.contains('\r') || name.contains('\n') || value.contains('\r') || value.contains('\n') {
+            continue;
+        }
+        response.extend_from_slice(name.as_bytes());
+        response.extend_from_slice(b": ");
+        response.extend_from_slice(value.as_bytes());
+        response.extend_from_slice(b"\r\n");
+    }
+
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(compressed_body);
+    response
+}
+
+fn build_exact_static_route_from_spec(
+    status: u16,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    compression_config: Option<&crate::compress::CompressionConfig>,
+) -> ExactStaticRoute {
+    let identity_close = build_response_bytes(status, headers, body, false);
+    let identity_ka = build_response_bytes(status, headers, body, true);
+
+    let content_type: Option<&[u8]> = headers.get("content-type").map(|v| v.as_bytes());
+    let has_content_encoding = headers.contains_key("content-encoding");
+
+    let (br_close, br_ka, gz_close, gz_ka) = match compression_config {
+        Some(config) if !has_content_encoding => {
+            let br = crate::compress::should_compress(
+                config, crate::compress::AcceptedEncoding::Brotli, body.len(), content_type, false,
+            ).and_then(|_| crate::compress::compress_body(body, crate::compress::AcceptedEncoding::Brotli, config, content_type));
+
+            let gz = crate::compress::should_compress(
+                config, crate::compress::AcceptedEncoding::Gzip, body.len(), content_type, false,
+            ).and_then(|_| crate::compress::compress_body(body, crate::compress::AcceptedEncoding::Gzip, config, content_type));
+
+            let br_variants = br.map(|compressed_body| {
+                let close = build_compressed_response_bytes(status, headers, &compressed_body, false, crate::compress::AcceptedEncoding::Brotli);
+                let ka = build_compressed_response_bytes(status, headers, &compressed_body, true, crate::compress::AcceptedEncoding::Brotli);
+                (Bytes::from(close), Bytes::from(ka))
+            });
+
+            let gz_variants = gz.map(|compressed_body| {
+                let close = build_compressed_response_bytes(status, headers, &compressed_body, false, crate::compress::AcceptedEncoding::Gzip);
+                let ka = build_compressed_response_bytes(status, headers, &compressed_body, true, crate::compress::AcceptedEncoding::Gzip);
+                (Bytes::from(close), Bytes::from(ka))
+            });
+
+            (
+                br_variants.as_ref().map(|(c, _)| c.clone()),
+                br_variants.map(|(_, k)| k),
+                gz_variants.as_ref().map(|(c, _)| c.clone()),
+                gz_variants.map(|(_, k)| k),
+            )
+        }
+        _ => (None, None, None, None),
+    };
+
+    ExactStaticRoute {
+        close_response: Bytes::from(identity_close),
+        keep_alive_response: Bytes::from(identity_ka),
+        close_response_br: br_close,
+        keep_alive_response_br: br_ka,
+        close_response_gzip: gz_close,
+        keep_alive_response_gzip: gz_ka,
     }
 }
 

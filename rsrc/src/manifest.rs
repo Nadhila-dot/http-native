@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde::de;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +16,8 @@ pub struct ManifestInput {
     pub ws_routes: Vec<WsRouteInput>,
     #[serde(default)]
     pub session: Option<SessionConfigInput>,
+    #[serde(default)]
+    pub compression: Option<CompressionConfigInput>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,3 +140,39 @@ pub struct WsRouteInput {
     pub path: String,
     pub handler_id: u32,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionConfigInput {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_min_size")]
+    pub min_size: usize,
+    #[serde(default = "default_brotli_quality")]
+    pub brotli_quality: u32,
+    #[serde(default = "default_gzip_level")]
+    pub gzip_level: u32,
+    #[serde(default, deserialize_with = "deserialize_quality_map")]
+    pub quality_map: Vec<ContentTypeQualityInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentTypeQualityInput {
+    /// Content-type pattern, e.g. "image/svg+xml", "application/json", "text/*"
+    pub pattern: String,
+    pub brotli_quality: Option<u32>,
+    pub gzip_level: Option<u32>,
+}
+
+fn deserialize_quality_map<'de, D>(deserializer: D) -> Result<Vec<ContentTypeQualityInput>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let opt: Option<Vec<ContentTypeQualityInput>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+fn default_min_size() -> usize { 1024 }
+fn default_brotli_quality() -> u32 { 4 }
+fn default_gzip_level() -> u32 { 6 }

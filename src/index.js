@@ -1657,6 +1657,20 @@ function buildCompiledApplication(app, normalizedOptions) {
     };
   }
 
+  const compressionMiddleware = app._middlewares.find(
+    (middleware) => middleware.handler._compressionConfig,
+  );
+  if (compressionMiddleware) {
+    const cfg = compressionMiddleware.handler._compressionConfig;
+    manifest.compression = {
+      enabled: true,
+      minSize: cfg.minSize,
+      brotliQuality: cfg.brotliQuality,
+      gzipLevel: cfg.gzipLevel,
+      qualityMap: cfg.qualityMap,
+    };
+  }
+
   const runtimeOptimizer = createRuntimeOptimizer(
     compiledRoutes,
     compiledMiddlewares,

@@ -30,6 +30,7 @@
     },
     "./hot": "./src/hot.js",
     "./session": "./src/session.js",
+    "./compress": "./src/compress.js",
     "./rate-limit": {
       "types": "./src/rate-limit.d.ts",
       "default": "./src/rate-limit.js"

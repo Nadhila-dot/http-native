@@ -419,6 +419,31 @@ export interface CorsOptions {
 /** Create a CORS middleware */
 export function cors(options?: CorsOptions): Middleware;
 
+// ─── Compression Types ────────────────────
+
+export interface ContentTypeQualityOption {
+  /** Content-type pattern, e.g. "image/svg+xml", "application/json", "text/*" */
+  pattern: string;
+  /** Brotli quality override for this content-type (0-11) */
+  brotliQuality?: number;
+  /** Gzip level override for this content-type (0-9) */
+  gzipLevel?: number;
+}
+
+export interface CompressOptions {
+  /** Minimum body size in bytes to compress (default 1024) */
+  minSize?: number;
+  /** Brotli quality level 0-11 (default 4) */
+  brotliQuality?: number;
+  /** Gzip compression level 0-9 (default 6) */
+  gzipLevel?: number;
+  /** Per-content-type quality overrides, checked in order */
+  qualityMap?: ContentTypeQualityOption[];
+}
+
+/** Create a compression middleware (Brotli + Gzip, handled in native layer) */
+export function compress(options?: CompressOptions): Middleware;
+
 // ─── Validation Types ───────────────────
 
 export interface ValidationSchema<T = unknown> {

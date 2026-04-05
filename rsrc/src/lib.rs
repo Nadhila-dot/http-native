@@ -1,4 +1,5 @@
 mod analyzer;
+pub mod compress;
 mod manifest;
 mod rate_limit;
 mod router;
@@ -113,6 +114,7 @@ struct HttpServerConfig {
     header_connection_prefix: Vec<u8>,
     header_content_length_prefix: Vec<u8>,
     header_transfer_encoding_prefix: Vec<u8>,
+    compression: Option<compress::CompressionConfig>,
 }
 
 impl HttpServerConfig {
@@ -175,6 +177,9 @@ impl HttpServerConfig {
                 FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX,
             )
             .into_bytes(),
+            compression: compress::CompressionConfig::from_manifest(
+                manifest.compression.as_ref(),
+            ),
         })
     }
 }
@@ -229,7 +234,8 @@ impl NativeServerHandle {
     pub fn reload(&self, manifest_json: String) -> napi::Result<()> {
         let manifest: ManifestInput = serde_json::from_str(&manifest_json).map_err(to_napi_error)?;
         validate_manifest(&manifest).map_err(to_napi_error)?;
-        let next_router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+        let comp_config = compress::CompressionConfig::from_manifest(manifest.compression.as_ref());
+        let next_router = Arc::new(Router::from_manifest(&manifest, comp_config.as_ref()).map_err(to_napi_error)?);
         let next_namespaces = next_router.cache_namespaces();
 
         {
@@ -581,7 +587,7 @@ pub fn start_server(
     validate_manifest(&manifest).map_err(to_napi_error)?;
     let server_config =
         Arc::new(HttpServerConfig::from_manifest(&manifest).map_err(to_napi_error)?);
-    let router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+    let router = Arc::new(Router::from_manifest(&manifest, server_config.compression.as_ref()).map_err(to_napi_error)?);
     let registered_cache_namespaces = router.cache_namespaces();
     register_cache_namespaces(&registered_cache_namespaces);
     let live_router = Arc::new(LiveRouter {
@@ -887,6 +893,8 @@ struct ParsedRequest<'a> {
     is_websocket_upgrade: bool,
     /// The Sec-WebSocket-Key header value, if present
     ws_key: Option<&'a str>,
+    /// Best accepted encoding from Accept-Encoding header
+    accepted_encoding: compress::AcceptedEncoding,
 }
 
 use monoio::time::timeout;
@@ -1007,6 +1015,7 @@ where
         let keep_alive = parsed.keep_alive;
         let has_body = parsed.has_body;
         let content_length = parsed.content_length;
+        let accepted_encoding = parsed.accepted_encoding;
 
         // Security (S1): reject requests with non-identity Transfer-Encoding
         if parsed.has_chunked_te {
@@ -1031,7 +1040,7 @@ where
                 if let Some(static_route) = router.exact_get_root() {
                     drop(parsed);
                     drain_consumed_bytes(buffer, header_bytes);
-                    write_exact_static_response(stream, static_route, keep_alive).await?;
+                    write_exact_static_response(stream, static_route, keep_alive, accepted_encoding).await?;
                     if !keep_alive {
                         stream.shutdown().await?;
                         return Ok(());
@@ -1042,7 +1051,7 @@ where
             if let Some(static_route) = router.exact_static_route(parsed.method, parsed.path) {
                 drop(parsed);
                 drain_consumed_bytes(buffer, header_bytes);
-                write_exact_static_response(stream, static_route, keep_alive).await?;
+                write_exact_static_response(stream, static_route, keep_alive, accepted_encoding).await?;
                 if !keep_alive {
                     stream.shutdown().await?;
                     return Ok(());
@@ -1075,7 +1084,7 @@ where
         // String/Vec allocations for method, target, path, and headers.
         if !has_body {
             let dispatch_decision =
-                build_dispatch_decision_zero_copy(router.as_ref(), &parsed, &[], peer_ip)?;
+                build_dispatch_decision_zero_copy(router.as_ref(), &parsed, &[], peer_ip, accepted_encoding, server_config.compression.as_ref())?;
 
             // Extract session before dropping parsed
             let (session_id, is_new_session) = resolve_session(session_store, parsed.cookie_header);
@@ -1085,7 +1094,7 @@ where
 
             match dispatch_decision {
                 DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, cache_namespace, url_bytes) => {
-                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, cache_namespace, &url_bytes, session_store, session_id, is_new_session)
+                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, cache_namespace, &url_bytes, session_store, session_id, is_new_session, accepted_encoding, server_config.compression.as_ref())
                         .await?;
                 }
                 DispatchDecision::SpecializedResponse(response) => {
@@ -1184,11 +1193,12 @@ where
             &headers_owned,
             &body_bytes,
             peer_ip,
+            accepted_encoding,
         )?;
 
         match dispatch_decision_owned {
             DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, cache_namespace, url_bytes) => {
-                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, cache_namespace, &url_bytes, session_store, session_id_body, is_new_session_body).await?;
+                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, cache_namespace, &url_bytes, session_store, session_id_body, is_new_session_body, accepted_encoding, server_config.compression.as_ref()).await?;
             }
             DispatchDecision::SpecializedResponse(response) => {
                 let (write_result, _) = stream.write_all(response).await;
@@ -1242,6 +1252,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
     let mut cookie_header: Option<&str> = None;
     let mut is_websocket_upgrade = false;
     let mut ws_key: Option<&str> = None;
+    let mut accepted_encoding = compress::AcceptedEncoding::Identity;
     let mut headers = Vec::with_capacity(req.headers.len());
 
     for header in req.headers.iter() {
@@ -1305,6 +1316,13 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
             ws_key = Some(value);
         }
 
+        // Compression: parse Accept-Encoding
+        if accepted_encoding != compress::AcceptedEncoding::Brotli
+            && name.eq_ignore_ascii_case("accept-encoding")
+        {
+            accepted_encoding = compress::parse_accept_encoding(value.as_bytes());
+        }
+
         headers.push((name, value));
     }
 
@@ -1321,6 +1339,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
         cookie_header,
         is_websocket_upgrade,
         ws_key,
+        accepted_encoding,
     })
 }
 
@@ -1344,6 +1363,7 @@ fn parse_hot_root_request(
     let header_end = find_header_end(bytes)?;
     let mut keep_alive = keep_alive;
     let mut has_body = false;
+    let mut accepted_encoding = compress::AcceptedEncoding::Identity;
     let mut line_start = bytes.iter().position(|b| *b == b'\n')? + 1;
 
     while line_start + 2 <= header_end {
@@ -1383,6 +1403,12 @@ fn parse_hot_root_request(
             if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
                 has_body = true;
             }
+        } else if accepted_encoding != compress::AcceptedEncoding::Brotli
+            && line.len() >= 17
+            && line[..16].eq_ignore_ascii_case(b"accept-encoding:")
+        {
+            let value = trim_ascii_spaces(&line[16..]);
+            accepted_encoding = compress::parse_accept_encoding(value);
         }
 
         line_start = next_end + 2;
@@ -1401,6 +1427,7 @@ fn parse_hot_root_request(
         cookie_header: None, // Hot path doesn't parse cookies
         is_websocket_upgrade: false,
         ws_key: None,
+        accepted_encoding,
     })
 }
 
@@ -1425,6 +1452,8 @@ fn build_dispatch_decision_zero_copy(
     parsed: &ParsedRequest<'_>,
     body: &[u8],
     peer_ip: Option<&str>,
+    accepted_encoding: compress::AcceptedEncoding,
+    compression_config: Option<&compress::CompressionConfig>,
 ) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
     let path_cow = String::from_utf8_lossy(parsed.path);
@@ -1465,21 +1494,22 @@ fn build_dispatch_decision_zero_copy(
 
     let mut cache_insertion = None;
     if let Some(cfg) = matched_route.cache_config {
-         let key = crate::router::interpolate_cache_key(cfg, parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         let base_key = crate::router::interpolate_cache_key(cfg, parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         let key = vary_cache_key_by_encoding(base_key, accepted_encoding);
          if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, key, parsed.keep_alive) {
              return Ok(DispatchDecision::CachedResponse(cached_response));
          }
          cache_insertion = Some((matched_route.cache_namespace, key, cfg.max_entries, cfg.ttl_secs));
     } else {
         // ncache lookup: check if a previous res.ncache() call cached this response
-        let ncache_key = compute_ncache_key(parsed.target);
+        let ncache_key = vary_cache_key_by_encoding(compute_ncache_key(parsed.target), accepted_encoding);
         if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, ncache_key, parsed.keep_alive) {
             return Ok(DispatchDecision::CachedResponse(cached_response));
         }
     }
 
     if let Some(response) =
-        build_dynamic_fast_path_response(&matched_route, url_str, &parsed.headers, parsed.keep_alive)?
+        build_dynamic_fast_path_response(&matched_route, url_str, &parsed.headers, parsed.keep_alive, accepted_encoding, compression_config)?
     {
         return Ok(DispatchDecision::SpecializedResponse(response));
     };
@@ -1513,6 +1543,7 @@ fn build_dispatch_decision_owned(
     headers: &[(String, String)],
     body: &[u8],
     peer_ip: Option<&str>,
+    accepted_encoding: compress::AcceptedEncoding,
 ) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(method).unwrap_or(UNKNOWN_METHOD_CODE);
 
@@ -1573,12 +1604,14 @@ fn build_dispatch_decision_owned(
              cookie_header: None,
              is_websocket_upgrade: false,
              ws_key: None,
+             accepted_encoding: compress::AcceptedEncoding::Identity,
          };
-         let key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         let base_key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         let key = vary_cache_key_by_encoding(base_key, accepted_encoding);
          cache_insertion = Some((matched_route.cache_namespace, key, cfg.max_entries, cfg.ttl_secs));
     } else {
         // ncache lookup: check if a previous res.ncache() call cached this response
-        let ncache_key = compute_ncache_key(target);
+        let ncache_key = vary_cache_key_by_encoding(compute_ncache_key(target), accepted_encoding);
         if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, ncache_key, false) {
             return Ok(DispatchDecision::CachedResponse(cached_response));
         }
@@ -1782,6 +1815,8 @@ fn build_dynamic_fast_path_response(
     url: &str,
     headers: &[(&str, &str)],
     keep_alive: bool,
+    encoding: compress::AcceptedEncoding,
+    compression_config: Option<&compress::CompressionConfig>,
 ) -> Result<Option<Vec<u8>>> {
     let Some(fast_path) = matched_route.fast_path else {
         return Ok(None);
@@ -1802,6 +1837,8 @@ fn build_dynamic_fast_path_response(
         fast_path.headers.as_ref(),
         &body,
         keep_alive,
+        encoding,
+        compression_config,
     )))
 }
 
@@ -2085,13 +2122,44 @@ fn build_response_bytes_fast(
     headers: &[(Box<str>, Box<str>)],
     body: &[u8],
     keep_alive: bool,
+    encoding: compress::AcceptedEncoding,
+    compression_config: Option<&compress::CompressionConfig>,
 ) -> Vec<u8> {
+    // ── Scan headers for content-type / content-encoding ──
+    let mut content_type: Option<&[u8]> = None;
+    let mut has_content_encoding = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.as_bytes());
+        } else if name.eq_ignore_ascii_case("content-encoding") {
+            has_content_encoding = true;
+        }
+    }
+
+    // ── Attempt compression ──
+    let compressed = compression_config.and_then(|config| {
+        compress::should_compress(config, encoding, body.len(), content_type, has_content_encoding)
+            .and_then(|enc| compress::compress_body(body, enc, config, content_type).map(|data| (data, enc)))
+    });
+
+    let (final_body, applied_encoding): (&[u8], Option<compress::AcceptedEncoding>) =
+        match &compressed {
+            Some((data, enc)) => (data.as_slice(), Some(*enc)),
+            None => (body, None),
+        };
+
+    // ── Build HTTP response ──
     let reason = status_reason(status);
     let connection = if keep_alive { "keep-alive" } else { "close" };
-    let body_len = body.len();
+    let body_len = final_body.len();
 
     let mut total_size =
         9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
+
+    if applied_encoding.is_some() {
+        // "content-encoding: br\r\nvary: accept-encoding\r\n" worst case ~50 bytes
+        total_size += 50;
+    }
 
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
@@ -2122,6 +2190,13 @@ fn build_response_bytes_fast(
     output.extend_from_slice(connection.as_bytes());
     output.extend_from_slice(b"\r\n");
 
+    // Compression headers
+    if let Some(enc) = applied_encoding {
+        output.extend_from_slice(b"content-encoding: ");
+        output.extend_from_slice(compress::encoding_header_value(enc));
+        output.extend_from_slice(b"\r\nvary: accept-encoding\r\n");
+    }
+
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
             continue;
@@ -2140,7 +2215,7 @@ fn build_response_bytes_fast(
     }
 
     output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(body);
+    output.extend_from_slice(final_body);
     output
 }
 
@@ -2150,14 +2225,34 @@ async fn write_exact_static_response<S>(
     stream: &mut S,
     static_route: &ExactStaticRoute,
     keep_alive: bool,
+    encoding: compress::AcceptedEncoding,
 ) -> Result<()>
 where
     S: AsyncWriteRent + Unpin,
 {
-    let response = if keep_alive {
-        static_route.keep_alive_response.clone()
-    } else {
-        static_route.close_response.clone()
+    let response = match (encoding, keep_alive) {
+        (compress::AcceptedEncoding::Brotli, true) => {
+            static_route.keep_alive_response_br.clone()
+                .unwrap_or_else(|| static_route.keep_alive_response.clone())
+        }
+        (compress::AcceptedEncoding::Brotli, false) => {
+            static_route.close_response_br.clone()
+                .unwrap_or_else(|| static_route.close_response.clone())
+        }
+        (compress::AcceptedEncoding::Gzip, true) => {
+            static_route.keep_alive_response_gzip.clone()
+                .unwrap_or_else(|| static_route.keep_alive_response.clone())
+        }
+        (compress::AcceptedEncoding::Gzip, false) => {
+            static_route.close_response_gzip.clone()
+                .unwrap_or_else(|| static_route.close_response.clone())
+        }
+        (compress::AcceptedEncoding::Identity, true) => {
+            static_route.keep_alive_response.clone()
+        }
+        (compress::AcceptedEncoding::Identity, false) => {
+            static_route.close_response.clone()
+        }
     };
 
     let (write_result, _) = stream.write_all(response).await;
@@ -2254,6 +2349,17 @@ fn compute_ncache_key(url_bytes: &[u8]) -> u64 {
     let mut hasher = FxHasher::default();
     url_bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Mix accepted encoding into a cache key so that identity/br/gzip
+/// requests are stored and looked up independently (Vary: Accept-Encoding).
+#[inline]
+fn vary_cache_key_by_encoding(key: u64, encoding: compress::AcceptedEncoding) -> u64 {
+    match encoding {
+        compress::AcceptedEncoding::Identity => key,
+        compress::AcceptedEncoding::Gzip => key ^ 0x9E3779B97F4A7C15,
+        compress::AcceptedEncoding::Brotli => key ^ 0x517CC1B727220A95,
+    }
 }
 
 // ─── Session Trailer Extraction ────────
@@ -2377,6 +2483,8 @@ async fn write_dynamic_dispatch_response<S>(
     session_store: Option<&session::SessionStore>,
     session_id: Option<[u8; session::SESSION_ID_BYTES]>,
     is_new_session: bool,
+    accepted_encoding: compress::AcceptedEncoding,
+    compression_config: Option<&compress::CompressionConfig>,
 ) -> Result<()>
 where
     S: AsyncWriteRent + Unpin,
@@ -2491,7 +2599,7 @@ where
                 return Ok(());
             }
 
-            match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
+            match build_http_response_from_dispatch(response.as_ref(), keep_alive, accepted_encoding, compression_config) {
                 Ok(mut http_response) => {
                     if let Some((cache_namespace, cache_key, max_entries, ttl_secs)) = cache_insertion {
                         // Route-level cache insertion (takes precedence over ncache)
@@ -2517,7 +2625,7 @@ where
                         if let Some((ncache_ttl, ncache_max_entries)) = extract_ncache_trailer(response.as_ref()) {
                             if ncache_ttl > 0 {
                                 if let Some(cache_namespace) = cache_namespace {
-                                    let ncache_key = compute_ncache_key(url_bytes);
+                                    let ncache_key = vary_cache_key_by_encoding(compute_ncache_key(url_bytes), accepted_encoding);
 
                                     let response_bytes_close: bytes::Bytes = if !keep_alive {
                                         http_response.clone().into()
@@ -2628,34 +2736,22 @@ where
 
 /// Build HTTP response bytes directly from the binary dispatch envelope,
 /// avoiding all intermediate String/Bytes allocations.
-fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) -> Result<Vec<u8>> {
+fn build_http_response_from_dispatch(
+    dispatch_bytes: &[u8],
+    keep_alive: bool,
+    encoding: compress::AcceptedEncoding,
+    compression_config: Option<&compress::CompressionConfig>,
+) -> Result<Vec<u8>> {
     let mut offset = 0usize;
     let status = read_u16(dispatch_bytes, &mut offset)?;
     let header_count = read_u16(dispatch_bytes, &mut offset)? as usize;
     let body_length = read_u32(dispatch_bytes, &mut offset)? as usize;
 
-    let reason = status_reason(status);
-    let connection = if keep_alive { "keep-alive" } else { "close" };
+    // ── Parse headers (collect refs, note content-type / content-encoding) ──
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(header_count);
+    let mut content_type: Option<&[u8]> = None;
+    let mut has_content_encoding = false;
 
-    // Conservative estimate: framing overhead + all dispatch bytes
-    let mut output = Vec::with_capacity(dispatch_bytes.len() + 128);
-
-    // Status line
-    output.extend_from_slice(b"HTTP/1.1 ");
-    write_u16(&mut output, status);
-    output.push(b' ');
-    output.extend_from_slice(reason.as_bytes());
-    output.extend_from_slice(b"\r\n");
-
-    // Mandatory headers
-    output.extend_from_slice(b"content-length: ");
-    write_usize(&mut output, body_length);
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(b"connection: ");
-    output.extend_from_slice(connection.as_bytes());
-    output.extend_from_slice(b"\r\n");
-
-    // User headers — read directly from binary without String allocation
     for _ in 0..header_count {
         let name_len = read_u8(dispatch_bytes, &mut offset)? as usize;
         let value_len = read_u16(dispatch_bytes, &mut offset)? as usize;
@@ -2669,6 +2765,62 @@ fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) ->
         let value_bytes = &dispatch_bytes[offset..offset + value_len];
         offset += value_len;
 
+        if name_bytes.eq_ignore_ascii_case(b"content-type") {
+            content_type = Some(value_bytes);
+        } else if name_bytes.eq_ignore_ascii_case(b"content-encoding") {
+            has_content_encoding = true;
+        }
+
+        headers.push((name_bytes, value_bytes));
+    }
+
+    // ── Extract body ──
+    if offset + body_length > dispatch_bytes.len() {
+        return Err(anyhow!("response body truncated"));
+    }
+    let body = &dispatch_bytes[offset..offset + body_length];
+
+    // ── Attempt compression ──
+    let compressed = compression_config.and_then(|config| {
+        compress::should_compress(config, encoding, body.len(), content_type, has_content_encoding)
+            .and_then(|enc| compress::compress_body(body, enc, config, content_type).map(|data| (data, enc)))
+    });
+
+    let (final_body, applied_encoding): (&[u8], Option<compress::AcceptedEncoding>) =
+        match &compressed {
+            Some((data, enc)) => (data.as_slice(), Some(*enc)),
+            None => (body, None),
+        };
+
+    // ── Assemble HTTP response ──
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let mut output = Vec::with_capacity(final_body.len() + 128);
+
+    // Status line
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Content-Length (uses final — possibly compressed — body size)
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, final_body.len());
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Compression headers
+    if let Some(enc) = applied_encoding {
+        output.extend_from_slice(b"content-encoding: ");
+        output.extend_from_slice(compress::encoding_header_value(enc));
+        output.extend_from_slice(b"\r\nvary: accept-encoding\r\n");
+    }
+
+    // User headers
+    for (name_bytes, value_bytes) in &headers {
         // Skip headers we already wrote
         if name_bytes.eq_ignore_ascii_case(b"content-length")
             || name_bytes.eq_ignore_ascii_case(b"connection")
@@ -2690,12 +2842,7 @@ fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) ->
     }
 
     output.extend_from_slice(b"\r\n");
-
-    // Body
-    if offset + body_length > dispatch_bytes.len() {
-        return Err(anyhow!("response body truncated"));
-    }
-    output.extend_from_slice(&dispatch_bytes[offset..offset + body_length]);
+    output.extend_from_slice(final_body);
 
     Ok(output)
 }

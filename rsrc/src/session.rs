@@ -49,13 +49,17 @@ impl SameSite {
             SameSite::None => "None",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
+impl std::str::FromStr for SameSite {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_ascii_lowercase().as_str() {
             "strict" => SameSite::Strict,
             "none" => SameSite::None,
             _ => SameSite::Lax,
-        }
+        })
     }
 }
 
@@ -105,11 +109,6 @@ impl SessionEntry {
         self.last_accessed = now;
         self.expires_at = now + max_age;
     }
-
-    /// Total size of all stored data in bytes.
-    fn data_size(&self) -> usize {
-        self.data.iter().map(|(k, v)| k.len() + v.len()).sum()
-    }
 }
 
 // ─── Session Shard ────────────────────────
@@ -131,16 +130,19 @@ impl SessionShard {
 pub struct SessionStore {
     shards: Box<[RwLock<SessionShard>]>,
     config: SessionConfig,
+    max_per_shard: usize,
 }
 
 impl SessionStore {
     pub fn new(config: SessionConfig) -> Self {
         let shards: Vec<RwLock<SessionShard>> =
             (0..SHARD_COUNT).map(|_| RwLock::new(SessionShard::new())).collect();
+        let max_per_shard = (config.max_sessions / SHARD_COUNT).max(1);
 
         Self {
             shards: shards.into_boxed_slice(),
             config,
+            max_per_shard,
         }
     }
 
@@ -263,15 +265,43 @@ impl SessionStore {
     /// Create or update a session with the given data mutations.
     /// `mutations` contains only the changed keys. Existing keys not in
     /// `mutations` are preserved.
+    /// Returns `true` if the upsert succeeded, `false` if the projected data
+    /// size would exceed `max_data_size` (no modifications are applied).
     pub fn upsert(
         &self,
         id: &[u8; SESSION_ID_BYTES],
         mutations: HashMap<String, Vec<u8>>,
         deleted_keys: &[String],
-    ) {
+    ) -> bool {
         let shard_idx = self.shard_index(id);
         let mut shard = self.shards[shard_idx].write();
         let max_age = Duration::from_secs(self.config.max_age_secs);
+        let is_new = !shard.map.contains_key(id);
+
+        // --- D5: Project the data size BEFORE applying mutations ---
+        let current_data = if is_new {
+            None
+        } else {
+            Some(&shard.map[id].data)
+        };
+
+        let projected_size = Self::projected_data_size(current_data, &mutations, deleted_keys);
+        if projected_size > self.config.max_data_size {
+            return false;
+        }
+
+        // --- S3: Enforce per-shard capacity with LRU eviction ---
+        if is_new && shard.map.len() >= self.max_per_shard {
+            // Evict the session with the oldest last_accessed timestamp
+            let lru_id = shard
+                .map
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_accessed)
+                .map(|(id, _)| *id);
+            if let Some(lru_id) = lru_id {
+                shard.map.remove(&lru_id);
+            }
+        }
 
         let entry = shard
             .map
@@ -288,14 +318,39 @@ impl SessionStore {
             entry.data.insert(key, value);
         }
 
-        // Enforce per-session data size limit
-        if entry.data_size() > self.config.max_data_size {
-            // Truncate by removing oldest entries until under limit.
-            // Simple strategy: just clear if over limit.
-            entry.data.clear();
+        entry.touch(max_age);
+        true
+    }
+
+    /// Calculate the projected data size after applying mutations and deletions
+    /// without actually modifying the entry.
+    fn projected_data_size(
+        current_data: Option<&HashMap<String, Vec<u8>>>,
+        mutations: &HashMap<String, Vec<u8>>,
+        deleted_keys: &[String],
+    ) -> usize {
+        let mut size: usize = 0;
+
+        if let Some(data) = current_data {
+            for (k, v) in data {
+                // Skip keys that will be deleted
+                if deleted_keys.contains(k) {
+                    continue;
+                }
+                // Skip keys that will be overwritten by mutations
+                if mutations.contains_key(k) {
+                    continue;
+                }
+                size += k.len() + v.len();
+            }
         }
 
-        entry.touch(max_age);
+        // Add sizes of all mutation entries
+        for (k, v) in mutations {
+            size += k.len() + v.len();
+        }
+
+        size
     }
 
     /// Destroy a session.

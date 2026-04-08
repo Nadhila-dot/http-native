@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { parse as acornParse } from "acorn";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -112,8 +113,176 @@ export function compileRouteShape(method, path) {
  * @returns {Object} Frozen access plan describing required request fields
  */
 export function analyzeRequestAccess(source) {
-  const plan = createEmptyAccessPlan();
   const normalizedSource = String(source ?? "");
+
+  /* @R3: try AST-based analysis first — falls back to regex on parse failure */
+  const astPlan = analyzeRequestAccessAST(normalizedSource);
+  if (astPlan) {
+    astPlan.jsonFastPath = detectJsonFastPath(normalizedSource);
+    return freezeAccessPlan(astPlan);
+  }
+
+  return analyzeRequestAccessRegex(normalizedSource);
+}
+
+/* @R3: AST-based access analysis using acorn. Walks MemberExpression nodes
+ * to find req.params.*, req.query.*, req.headers.*, req.method, etc.
+ * Correctly ignores string literals and comments that fool the regex path. */
+function analyzeRequestAccessAST(source) {
+  let ast;
+  try {
+    /* wrap source as a program — handles arrow functions, function declarations,
+     * and function expressions returned by Function.prototype.toString() */
+    ast = acornParse(`(${source})`, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+    });
+  } catch {
+    return null; /* parse failed — caller falls back to regex */
+  }
+
+  const plan = createEmptyAccessPlan();
+  const reqNames = findReqParamNames(ast);
+  if (reqNames.size === 0) {
+    return plan; /* handler doesn't declare a req parameter */
+  }
+
+  walkNode(ast, (node) => {
+    if (node.type !== "MemberExpression") return;
+    if (!isReqIdentifier(node.object, reqNames)) return;
+
+    const prop = memberPropName(node);
+    if (!prop) {
+      /* dynamic bracket access on req itself: req[variable] */
+      plan.method = true;
+      plan.path = true;
+      plan.url = true;
+      plan.fullParams = true;
+      plan.fullQuery = true;
+      plan.fullHeaders = true;
+      plan.dispatchKind = "generic_fallback";
+      return;
+    }
+
+    switch (prop) {
+      case "method": plan.method = true; break;
+      case "path":   plan.path = true;   break;
+      case "url":    plan.url = true;    break;
+      case "params": markSubAccess(node, plan, "paramKeys", "fullParams", identity); break;
+      case "query":  markSubAccess(node, plan, "queryKeys", "fullQuery", identity); break;
+      case "headers": markSubAccess(node, plan, "headerKeys", "fullHeaders", normalizeHeaderLookup); break;
+      case "header":
+        /* req.header("content-type") call pattern */
+        markCallArg(node, plan, "headerKeys", "fullHeaders", normalizeHeaderLookup);
+        break;
+      case "body": break; /* body is always materialized when present */
+      default: break;
+    }
+  });
+
+  return plan;
+}
+
+/* find the parameter name(s) that represent the request object.
+ * handles: (req, res) =>, function(request, response), destructuring */
+function findReqParamNames(ast) {
+  const names = new Set();
+  walkNode(ast, (node) => {
+    if (
+      node.type === "ArrowFunctionExpression" ||
+      node.type === "FunctionExpression" ||
+      node.type === "FunctionDeclaration"
+    ) {
+      const first = node.params?.[0];
+      if (first?.type === "Identifier") {
+        names.add(first.name);
+      } else if (first?.type === "ObjectPattern") {
+        /* destructured req: ({ params, query }) => ... — full access */
+        names.add("__destructured__");
+      }
+    }
+  });
+  return names;
+}
+
+/* check if a node is an Identifier matching a known req param name */
+function isReqIdentifier(node, reqNames) {
+  return node?.type === "Identifier" && reqNames.has(node.name);
+}
+
+/* extract a static property name from a MemberExpression, or null if dynamic */
+function memberPropName(node) {
+  if (!node.computed && node.property?.type === "Identifier") {
+    return node.property.name;
+  }
+  if (node.computed && node.property?.type === "Literal" && typeof node.property.value === "string") {
+    return node.property.value;
+  }
+  return null;
+}
+
+/* given req.params (or .query/.headers) as a MemberExpression, check
+ * if the parent accesses a specific key or the whole object */
+function markSubAccess(parentNode, plan, keysField, fullField, transform) {
+  const grandparent = parentNode._parent;
+  if (!grandparent || grandparent.type !== "MemberExpression" || grandparent.object !== parentNode) {
+    /* bare `req.params` usage (passed as argument, spread, etc.) */
+    plan[fullField] = true;
+    plan.dispatchKind = "generic_fallback";
+    return;
+  }
+  const key = memberPropName(grandparent);
+  if (key) {
+    plan[keysField].add(transform(key));
+  } else {
+    /* dynamic bracket: req.params[variable] */
+    plan[fullField] = true;
+    plan.dispatchKind = "generic_fallback";
+  }
+}
+
+/* given req.header as a MemberExpression, check if it's called with a
+ * static string argument: req.header("content-type") */
+function markCallArg(parentNode, plan, keysField, fullField, transform) {
+  const grandparent = parentNode._parent;
+  if (grandparent?.type === "CallExpression" && grandparent.callee === parentNode) {
+    const arg = grandparent.arguments?.[0];
+    if (arg?.type === "Literal" && typeof arg.value === "string") {
+      plan[keysField].add(transform(arg.value));
+      return;
+    }
+  }
+  /* dynamic call: req.header(variable) */
+  plan[fullField] = true;
+  plan.dispatchKind = "generic_fallback";
+}
+
+/* minimal recursive AST walker that sets _parent on each child node */
+function walkNode(node, visitor) {
+  if (!node || typeof node !== "object") return;
+  visitor(node);
+  for (const key of Object.keys(node)) {
+    if (key === "_parent") continue;
+    const child = node[key];
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        if (item && typeof item.type === "string") {
+          item._parent = node;
+          walkNode(item, visitor);
+        }
+      }
+    } else if (child && typeof child.type === "string") {
+      child._parent = node;
+      walkNode(child, visitor);
+    }
+  }
+}
+
+/* @R3: regex fallback — original analysis path for unparseable sources */
+function analyzeRequestAccessRegex(normalizedSource) {
+  const plan = createEmptyAccessPlan();
 
   plan.method = /\breq\.method\b/.test(normalizedSource);
   plan.path = /\breq\.path\b/.test(normalizedSource);
@@ -1086,7 +1255,7 @@ function readU16(bytes, offset) {
   if (offset + 2 > bytes.byteLength) {
     throw new Error("Request envelope truncated");
   }
-  return bytes[offset] | (bytes[offset + 1] << 8);
+  return (bytes[offset] | (bytes[offset + 1] << 8)) >>> 0;
 }
 
 function readU32(bytes, offset) {

@@ -14,7 +14,6 @@ import {
   mergeRequestAccessPlans,
   releaseRequestObject,
 } from "./bridge.js";
-import { encodeSessionTrailer } from "./session.js";
 import { loadNativeModule } from "./native.js";
 import defaultHttpServerConfig, {
   normalizeHttpServerConfig,
@@ -24,7 +23,7 @@ import { createRouteDevCommentWriter } from "./dev/comments.js";
 import { createRuntimeHotReloadController } from "./dev/hot-reload.js";
 import { createRuntimeOptimizer } from "./opt/runtime.js";
 
-const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
+const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
 const NOOP_NEXT = () => undefined;
@@ -486,6 +485,23 @@ const RESPONSE_PROTO = {
       id: streamId,
     };
   },
+
+  /**
+   * Redirect the client to a different URL.
+   *
+   * @param {string} url    - Target URL
+   * @param {number} [status=302] - HTTP redirect status code (301, 302, 307, 308)
+   * @returns {Response}
+   */
+  redirect(url, status = 302) {
+    const state = this._state;
+    if (state.finished) return this;
+    state.status = Number(status);
+    state.headers["location"] = String(url);
+    state.body = EMPTY_BUFFER;
+    state.finished = true;
+    return this;
+  },
 };
 
 function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
@@ -827,13 +843,7 @@ function createDispatcher(initialSnapshot) {
       ? performance.now() - dispatchStartMs
       : undefined;
     state.runtimeOptimizer?.recordDispatch(route, req, responseSnapshot, dispatchDurationMs);
-    let encoded = encodeResponseEnvelope(responseSnapshot);
-
-    // Append session trailer if session mutations exist
-    const sessionTrailer = encodeSessionTrailer(res._sessionState);
-    if (sessionTrailer) {
-      encoded = Buffer.concat([encoded, sessionTrailer]);
-    }
+    const encoded = encodeResponseEnvelope(responseSnapshot);
 
     maybePromoteRouteResponseCache(
       route,
@@ -929,6 +939,16 @@ function normalizeStaticRouteRegistration(path, html, options = {}) {
   };
 }
 
+const _existsCache = new Map();
+function cachedExistsSync(filePath) {
+  let result = _existsCache.get(filePath);
+  if (result === undefined) {
+    result = existsSync(filePath);
+    _existsCache.set(filePath, result);
+  }
+  return result;
+}
+
 function captureRouteRegistrationLocation() {
   const stack = new Error().stack;
   if (!stack) {
@@ -961,7 +981,7 @@ function captureRouteRegistrationLocation() {
       filePath = path.resolve(process.cwd(), filePath);
     }
 
-    if (!existsSync(filePath)) {
+    if (!cachedExistsSync(filePath)) {
       continue;
     }
 
@@ -1061,8 +1081,7 @@ function maybePromoteRouteResponseCache(route, snapshot, encoded, devRouteCommen
 }
 
 function buildSnapshotCacheKey(snapshot) {
-  let hash = 0x811c9dc5;
-  hash = fnv1aString(hash, String(snapshot.status ?? 200));
+  let hash = fnv1aString(0x811c9dc5, String(snapshot.status ?? 200));
 
   const headers = snapshot.headers ?? Object.create(null);
   const headerNames = Object.keys(headers);
@@ -1078,25 +1097,43 @@ function buildSnapshotCacheKey(snapshot) {
       : EMPTY_BUFFER;
   hash = fnv1aBytes(hash, body);
 
-  return `${hash}:${body.length}:${headerNames.length}`;
+  return `${fnv1aFinish(hash)}:${body.length}:${headerNames.length}`;
 }
 
+/* @B3: dual-lane FNV-1a — two independent 32-bit hashes with different offsets
+ * and primes, yielding 64-bit effective collision resistance in JS without
+ * BigInt overhead. The "lo" lane is standard FNV-1a-32; the "hi" lane uses
+ * FNV-1a-32 seeded at a different offset with a co-prime multiplier. */
+
+/* @param seed — 64-bit state as { lo, hi } or a plain 32-bit number (legacy) */
+/* @param value — string to hash */
 function fnv1aString(seed, value) {
-  let hash = seed >>> 0;
+  let lo = typeof seed === "number" ? seed >>> 0 : seed.lo >>> 0;
+  let hi = typeof seed === "number" ? (seed ^ 0x6c62272e) >>> 0 : seed.hi >>> 0;
   for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
+    const c = value.charCodeAt(index);
+    lo = Math.imul(lo ^ c, 0x01000193) >>> 0;
+    hi = Math.imul(hi ^ c, 0x01000193) >>> 0;
   }
-  return hash >>> 0;
+  return { lo, hi };
 }
 
+/* @param seed — 64-bit state as { lo, hi } or a plain 32-bit number (legacy) */
+/* @param bytes — Uint8Array to hash */
 function fnv1aBytes(seed, bytes) {
-  let hash = seed >>> 0;
+  let lo = typeof seed === "number" ? seed >>> 0 : seed.lo >>> 0;
+  let hi = typeof seed === "number" ? (seed ^ 0x6c62272e) >>> 0 : seed.hi >>> 0;
   for (let index = 0; index < bytes.length; index += 1) {
-    hash ^= bytes[index];
-    hash = Math.imul(hash, 0x01000193);
+    const b = bytes[index];
+    lo = Math.imul(lo ^ b, 0x01000193) >>> 0;
+    hi = Math.imul(hi ^ b, 0x01000193) >>> 0;
   }
-  return hash >>> 0;
+  return { lo, hi };
+}
+
+/* @param h — dual-lane hash state { lo, hi } */
+function fnv1aFinish(h) {
+  return ((h.hi >>> 0) * 0x100000000 + (h.lo >>> 0)).toString(16);
 }
 
 // ─── Fast-Path Probe ────────────────────
@@ -1498,7 +1535,7 @@ function buildRouteCacheNamespace(route) {
     }
   }
 
-  return `route:${hash.toString(16)}`;
+  return `route:${fnv1aFinish(hash)}`;
 }
 
 function normalizeApplicationReloadConfig(options = {}) {
@@ -1637,7 +1674,7 @@ function buildCompiledApplication(app, normalizedOptions) {
       cert: normalizedOptions.tls.cert,
       key: normalizedOptions.tls.key,
       ca: normalizedOptions.tls.ca,
-      passphrase: normalizedOptions.tls.passphrase,
+      passphrase: normalizedOptions.tls.passphrase ? "[REDACTED]" : undefined,
     };
   }
 
@@ -2088,14 +2125,6 @@ export function createApp(config = {}) {
         },
       };
 
-      // Preserve previous behavior by starting even when callers don't await.
-      queueMicrotask(() => {
-        if (startBlockedByRemovedOpt) {
-          return;
-        }
-        void start();
-      });
-
       return chainableListen;
     },
   };
@@ -2118,6 +2147,7 @@ export function createApp(config = {}) {
   app.delete = createMethodRegistrar(app, "DELETE");
   app.patch = createMethodRegistrar(app, "PATCH");
   app.options = createMethodRegistrar(app, "OPTIONS");
+  app.head = createMethodRegistrar(app, "HEAD");
   app.all = createMethodRegistrar(app, "ALL");
   app.static = (routePath, html, options = {}) => {
     const groupPrefix = app._groupPrefix ?? "/";
@@ -2135,6 +2165,30 @@ export function createApp(config = {}) {
       handlerId: app._allocateHandlerId(),
     });
     return app;
+  };
+
+  /**
+   * Register a health check endpoint served entirely from the Rust static
+   * fast path — zero JS dispatch, zero allocation per request. The response
+   * is pre-built at startup with Brotli/Gzip compression variants.
+   *
+   * @param {string} routePath - Health check path (e.g. "/healthz")
+   * @param {Object} [options]
+   * @param {Object} [options.body]    - JSON body (default: { status: "ok" })
+   * @param {number} [options.status]  - HTTP status code (default: 200)
+   * @param {Object} [options.headers] - Additional response headers
+   * @returns {Application}
+   */
+  app.health = (routePath, options = {}) => {
+    const body = JSON.stringify(options.body ?? { status: "ok" });
+    const headers = {
+      "content-type": "application/json; charset=utf-8",
+      ...(options.headers ?? {}),
+    };
+    return app.static(routePath, body, {
+      status: options.status ?? 200,
+      headers,
+    });
   };
 
   return app;

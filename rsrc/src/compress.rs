@@ -125,16 +125,31 @@ pub fn parse_accept_encoding(value: &[u8]) -> AcceptedEncoding {
     let mut best = AcceptedEncoding::Identity;
     for part in value.split(|&b| b == b',') {
         let trimmed = trim_ascii(part);
+        let mut segments = trimmed.split(|&b| b == b';');
         // Extract the encoding name (before any ;q= weight)
-        let name = trimmed
-            .split(|&b| b == b';')
+        let name = segments
             .next()
             .map(trim_ascii)
             .unwrap_or(trimmed);
-        if name.eq_ignore_ascii_case(b"br") {
-            return AcceptedEncoding::Brotli; // Best possible — return immediately
+
+        // Check for q=0 which means the client explicitly rejects this encoding
+        let rejected = segments.any(|seg| {
+            let seg = trim_ascii(seg);
+            if seg.len() >= 2 && seg[0].eq_ignore_ascii_case(&b'q') && seg[1] == b'=' {
+                let qval = trim_ascii(&seg[2..]);
+                // Match q=0, q=0., q=0.0, q=0.00, q=0.000
+                matches!(qval, b"0" | b"0." | b"0.0" | b"0.00" | b"0.000")
+            } else {
+                false
+            }
+        });
+        if rejected {
+            continue;
         }
-        if name.eq_ignore_ascii_case(b"gzip") {
+
+        if name.eq_ignore_ascii_case(b"br") {
+            best = AcceptedEncoding::Brotli;
+        } else if name.eq_ignore_ascii_case(b"gzip") && best != AcceptedEncoding::Brotli {
             best = AcceptedEncoding::Gzip;
         }
     }

@@ -9,6 +9,9 @@ export interface Request {
   /** HTTP method (GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD) */
   readonly method: string;
 
+  /** Request ID (available when requestId middleware is used) */
+  id?: string;
+
   /** URL path without query string */
   readonly path: string;
 
@@ -129,6 +132,31 @@ export interface Response {
    * @param options.maxEntries - Max LRU entries per route (default 256)
    */
   ncache(data: unknown, ttl: number, options?: { maxEntries?: number }): Response;
+
+  /**
+   * Redirect the client to a different URL.
+   *
+   * @param url - Target URL
+   * @param status - HTTP redirect status code (default 302)
+   */
+  redirect(url: string, status?: number): Response;
+
+  /**
+   * Start a chunked streaming response. Returns a StreamWriter for writing
+   * chunks incrementally, or null if the response is already finished.
+   */
+  stream(options?: { contentType?: string }): StreamWriter | null;
+}
+
+export interface StreamWriter {
+  /** Write a chunk to the stream (string, Buffer, Uint8Array, or object → JSON) */
+  write(data: string | Buffer | Uint8Array | object): boolean;
+
+  /** End the stream, optionally writing a final chunk */
+  end(finalChunk?: string | Buffer | Uint8Array | object): boolean;
+
+  /** The internal stream ID */
+  readonly id: number;
 }
 
 export type NextFunction = () => Promise<void>;
@@ -375,17 +403,53 @@ export interface Application {
   /** Register an OPTIONS route handler */
   options(path: string, handler: RouteHandler): Application;
 
+  /** Register a HEAD route handler */
+  head(path: string, handler: RouteHandler): Application;
+
   /** Register a handler for all HTTP methods */
   all(path: string, handler: RouteHandler): Application;
 
   /** Register an exact GET HTML route served from the native static fast path */
   static(path: string, html: string, options?: HtmlResponseOptions): Application;
 
+  /**
+   * Register a health check endpoint served from the Rust static fast path.
+   * Zero JS dispatch overhead — response is pre-built at startup.
+   */
+  health(path: string, options?: HealthCheckOptions): Application;
+
+  /** Register a WebSocket upgrade handler for a path */
+  ws(path: string, handlers: WebSocketHandlers): Application;
+
   /** Configure first-class app reload behavior for dev runtimes */
   reload(options?: ReloadOptions): Application;
 
   /** Start the server and listen for connections */
   listen(options?: ListenOptions): ListenHandle;
+}
+
+// ─── WebSocket Types ───────────────────
+
+export interface WebSocketHandlers {
+  /** Called when a new WebSocket connection opens */
+  open?(ws: WebSocketConnection): void | Promise<void>;
+
+  /** Called when a message is received from the client */
+  message?(ws: WebSocketConnection, data: string | Buffer): void | Promise<void>;
+
+  /** Called when the WebSocket connection closes */
+  close?(ws: WebSocketConnection, code?: number, reason?: string): void | Promise<void>;
+}
+
+export interface WebSocketConnection {
+  /** Send a text or binary message to the client */
+  send(data: string | Buffer | Uint8Array): void;
+
+  /** Close the WebSocket connection */
+  close(code?: number, reason?: string): void;
+
+  /** The internal connection ID */
+  readonly id: number;
 }
 
 /** Create a new http-native application */
@@ -522,3 +586,72 @@ export function createNativeRateLimiter(options?: NativeRateLimiterOptions): Nat
 
 /** Create a high-level middleware wrapper around the native limiter handle. */
 export function rateLimit(options: RateLimitOptions): Middleware;
+
+// ─── Health Check Types ────────────────
+
+export interface HealthCheckOptions {
+  /** JSON body to return (default: { status: "ok" }) */
+  body?: Record<string, unknown>;
+  /** HTTP status code (default: 200) */
+  status?: number;
+  /** Additional response headers */
+  headers?: Record<string, string>;
+}
+
+// ─── Security Headers Types ────────────
+
+export interface HstsOptions {
+  /** Max age in seconds (default: 31536000 = 1 year) */
+  maxAge?: number;
+  /** Include subdomains (default: true) */
+  includeSubDomains?: boolean;
+  /** Add preload flag */
+  preload?: boolean;
+}
+
+export interface ContentSecurityPolicyOptions {
+  /** CSP directives as camelCase keys → source arrays */
+  directives?: Record<string, string | string[]>;
+}
+
+export interface HelmetOptions {
+  /** HSTS header (default: enabled with 1-year max-age). Set false to disable. */
+  hsts?: HstsOptions | boolean;
+  /** Content-Security-Policy. Set false or omit to disable. */
+  contentSecurityPolicy?: ContentSecurityPolicyOptions | boolean;
+  /** X-Frame-Options value (default: "DENY"). Set false to disable. */
+  xFrameOptions?: string | boolean;
+  /** X-Content-Type-Options (default: "nosniff"). Set false to disable. */
+  xContentTypeOptions?: boolean;
+  /** X-XSS-Protection (default: "0"). Set false to disable. */
+  xXssProtection?: boolean;
+  /** Referrer-Policy (default: "strict-origin-when-cross-origin"). Set false to disable. */
+  referrerPolicy?: string | boolean;
+  /** Cross-Origin-Opener-Policy (default: "same-origin"). Set false to disable. */
+  crossOriginOpenerPolicy?: string | boolean;
+  /** Cross-Origin-Resource-Policy (default: "same-origin"). Set false to disable. */
+  crossOriginResourcePolicy?: string | boolean;
+  /** Permissions-Policy. Set false or omit to disable. */
+  permissionsPolicy?: Record<string, string[]> | boolean;
+  /** X-DNS-Prefetch-Control (default: "off"). Set false to disable. */
+  xDnsPrefetchControl?: string | boolean;
+  /** X-Permitted-Cross-Domain-Policies (default: "none"). Set false to disable. */
+  xPermittedCrossDomainPolicies?: string | boolean;
+}
+
+/** Create a security headers middleware with sane defaults */
+export function helmet(options?: HelmetOptions): Middleware;
+
+// ─── Request ID Types ──────────────────
+
+export interface RequestIdOptions {
+  /** Incoming request header to read (default: "x-request-id") */
+  header?: string;
+  /** Response header to set (default: same as header; false to disable) */
+  responseHeader?: string | false;
+  /** Custom ID generator function (default: crypto.randomUUID) */
+  generate?: () => string;
+}
+
+/** Create a request ID middleware for distributed tracing correlation */
+export function requestId(options?: RequestIdOptions): Middleware;

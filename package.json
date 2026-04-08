@@ -23,19 +23,39 @@
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
     },
-    "./cors": "./src/cors.js",
+    "./cors": {
+      "types": "./src/index.d.ts",
+      "default": "./src/cors.js"
+    },
     "./dev": {
       "types": "./src/dev/index.d.ts",
       "default": "./src/dev/index.js"
     },
     "./hot": "./src/hot.js",
-    "./session": "./src/session.js",
-    "./compress": "./src/compress.js",
+    "./session": {
+      "types": "./src/session.d.ts",
+      "default": "./src/session.js"
+    },
+    "./compress": {
+      "types": "./src/index.d.ts",
+      "default": "./src/compress.js"
+    },
     "./rate-limit": {
       "types": "./src/rate-limit.d.ts",
       "default": "./src/rate-limit.js"
     },
-    "./validate": "./src/validate.js",
+    "./validate": {
+      "types": "./src/index.d.ts",
+      "default": "./src/validate.js"
+    },
+    "./helmet": {
+      "types": "./src/index.d.ts",
+      "default": "./src/helmet.js"
+    },
+    "./request-id": {
+      "types": "./src/index.d.ts",
+      "default": "./src/request-id.js"
+    },
     "./http-server.config": "./src/http-server.config.js"
   },
   "scripts": {

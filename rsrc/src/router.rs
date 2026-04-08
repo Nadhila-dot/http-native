@@ -1,10 +1,20 @@
 use anyhow::Result;
+use arrayvec::ArrayVec;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// @S4/@S6: per-process randomly-keyed SipHash state. `RandomState::new()`
+/// seeds from OS entropy, so hash values are unpredictable to attackers —
+/// prevents cache-key collision attacks on vary-by params/headers.
+fn keyed_state() -> &'static RandomState {
+    static STATE: OnceLock<RandomState> = OnceLock::new();
+    STATE.get_or_init(RandomState::new)
+}
 
 use crate::analyzer::{
     analyze_dynamic_fast_path, analyze_route, normalize_path, parse_segments, AnalysisResult,
@@ -44,7 +54,9 @@ pub struct ExactStaticRoute {
 pub struct MatchedRoute<'a, 'b> {
     pub handler_id: u32,
     pub cache_namespace: u64,
-    pub param_values: Vec<&'b str>,
+    /// Stack-allocated parameter values — avoids heap allocation per route match.
+    /// Capacity is MAX_STACK_SEGMENTS (16), matching the maximum segment depth.
+    pub param_values: ArrayVec<&'b str, MAX_STACK_SEGMENTS>,
     pub param_names: &'a [Box<str>],
     pub header_keys: &'a [Box<str>],
     pub full_headers: bool,
@@ -134,6 +146,9 @@ impl RadixNode {
     /// Insert a route into the radix tree
     fn insert(&mut self, segments: &[RouteSegment], spec: DynamicRouteSpec) {
         if segments.is_empty() {
+            if self.handler.is_some() {
+                log_warn!("duplicate route registered, overwriting previous handler");
+            }
             self.handler = Some(spec);
             return;
         }
@@ -171,11 +186,14 @@ impl RadixNode {
         }
     }
 
-    /// Match a request path against this radix tree — O(M) where M = segment count
+    /// Match a request path against this radix tree — O(M) where M = segment count.
+    ///
+    /// /* @param segments     — path segments split on '/' */
+    /// /* @param param_values — stack-allocated accumulator for captured :param values */
     fn match_path<'a, 'b>(
         &'a self,
         segments: &[&'b str],
-        param_values: &mut Vec<&'b str>,
+        param_values: &mut ArrayVec<&'b str, MAX_STACK_SEGMENTS>,
     ) -> Option<&'a DynamicRouteSpec> {
         if segments.is_empty() {
             return self.handler.as_ref();
@@ -320,7 +338,7 @@ impl Router {
             return Some(MatchedRoute {
                 handler_id: route_spec.handler_id,
                 cache_namespace: route_spec.cache_namespace,
-                param_values: Vec::new(),
+                param_values: ArrayVec::new(),
                 param_names: route_spec.param_names.as_ref(),
                 header_keys: route_spec.header_keys.as_ref(),
                 full_headers: route_spec.full_headers,
@@ -336,7 +354,7 @@ impl Router {
         let tree = self.radix_trees.get(&method_key)?;
         let mut seg_buf = [""; MAX_STACK_SEGMENTS];
         let seg_count = split_segments_stack(path, &mut seg_buf);
-        let mut param_values = Vec::with_capacity(4);
+        let mut param_values = ArrayVec::new();
         let spec = if seg_count <= MAX_STACK_SEGMENTS {
             tree.match_path(&seg_buf[..seg_count], &mut param_values)?
         } else {
@@ -642,8 +660,9 @@ fn build_exact_static_route_from_spec(
     }
 }
 
+/// /* @param value — cache namespace string (e.g. "GET:/users/:id") */
 fn hash_cache_namespace(value: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = keyed_state().build_hasher();
     value.hash(&mut hasher);
     hasher.finish()
 }
@@ -706,73 +725,7 @@ fn build_close_response(status: u16, headers: &HashMap<String, String>, body: &[
     build_response_bytes(status, headers, body, false)
 }
 
-fn build_response_bytes(
-    status: u16,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    keep_alive: bool,
-) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 {} {}\r\ncontent-length: {}\r\nconnection: {}\r\n",
-        status,
-        status_reason(status),
-        body.len(),
-        if keep_alive { "keep-alive" } else { "close" }
-    )
-    .into_bytes();
-
-    for (name, value) in headers {
-        // Security: skip headers with CRLF injection
-        if name.contains('\r')
-            || name.contains('\n')
-            || value.contains('\r')
-            || value.contains('\n')
-        {
-            continue;
-        }
-        response.extend_from_slice(name.as_bytes());
-        response.extend_from_slice(b": ");
-        response.extend_from_slice(value.as_bytes());
-        response.extend_from_slice(b"\r\n");
-    }
-
-    response.extend_from_slice(b"\r\n");
-    response.extend_from_slice(body);
-    response
-}
-
-// Todo: Are these expensive? if so remove them.
-
-fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        422 => "Unprocessable Entity",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
-    }
-}
+use crate::http_utils::{build_response_bytes, status_reason};
 
 // ─── Native Zero-Allocation LRU Cache ───
 
@@ -975,15 +928,23 @@ pub fn insert_cached_response(cache_namespace: u64, key: u64, entry: CacheEntry,
     });
 }
 
+/// Build a collision-resistant cache key from the route's vary configuration.
+/// Uses per-process keyed SipHash (@S4/@S6) so attackers cannot predict collisions.
+///
+/// /* @param config       — route-level cache configuration with vary keys */
+/// /* @param headers      — pre-parsed request header pairs */
+/// /* @param url          — full request URL (for query param extraction) */
+/// /* @param param_names  — route parameter names from the route spec */
+/// /* @param param_values — captured parameter values from the radix match */
 pub fn interpolate_cache_key(
     config: &RouteCacheConfig,
-    parsed: &crate::ParsedRequest<'_>,
+    headers: &[(&str, &str)],
     url: &str,
     param_names: &[Box<str>],
     param_values: &[&str],
 ) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    
+    let mut hasher = keyed_state().build_hasher();
+
     for vary_key in config.vary_keys.iter() {
         match vary_key {
             CacheVaryKey::QueryParam(name) => {
@@ -1029,7 +990,7 @@ pub fn interpolate_cache_key(
             CacheVaryKey::Header(name) => {
                 let name_str = name.as_ref();
                 let mut found = false;
-                for (h_name, h_val) in parsed.headers.iter() {
+                for (h_name, h_val) in headers.iter() {
                     if h_name.eq_ignore_ascii_case(name_str) {
                         name_str.hash(&mut hasher);
                         h_val.hash(&mut hasher);
@@ -1044,6 +1005,6 @@ pub fn interpolate_cache_key(
             }
         }
     }
-    
+
     hasher.finish()
 }

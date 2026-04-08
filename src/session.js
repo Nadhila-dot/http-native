@@ -357,13 +357,3 @@ function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
 
-// ─── Session Trailer (for backward compat) ──
-
-/**
- * Encode session write trailer. Returns null since session ops now go
- * directly through NAPI — no trailer needed for MemoryStore.
- * Kept for API compatibility.
- */
-export function encodeSessionTrailer(sessionState) {
-  return null;
-}

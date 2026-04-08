@@ -114,6 +114,9 @@
     "setup:native": "bun scripts/setup-native.mjs || node scripts/setup-native.mjs",
     "test": "bun run build && bun .github/tests/test.js && bun .github/tests/test-dev.js"
   },
+  "dependencies": {
+    "acorn": "^8.14.1"
+  },
   "devDependencies": {
     "express": "^5.1.0"
   }

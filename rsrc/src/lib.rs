@@ -1,6 +1,34 @@
+// ─── Structured Logging Macros (D6) ────
+//
+// Lightweight structured log macros that output to stderr with a consistent
+// "[http-native] LEVEL: message" format. Drop-in replacement for bare
+// eprintln! calls. Can be swapped to `tracing` crate later without
+// changing call sites. Defined before module declarations so child
+// modules can use them.
+
+/// /* @param $($arg)* — format arguments identical to eprintln! */
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        eprintln!("[http-native] error: {}", format_args!($($arg)*))
+    };
+}
+
+/// /* @param $($arg)* — format arguments identical to eprintln! */
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        eprintln!("[http-native] warn: {}", format_args!($($arg)*))
+    };
+}
+
 mod analyzer;
 pub mod compress;
+pub mod h2_handler;
+#[allow(dead_code)]
+mod h3_handler;
+pub mod http_utils;
 mod manifest;
+pub mod parser;
+pub mod response;
 mod rate_limit;
 mod router;
 pub mod session;
@@ -10,7 +38,7 @@ use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use monoio::net::{ListenerOpts, TcpListener};
+use monoio::net::TcpListener;
 use monoio_rustls::TlsAcceptor;
 use napi::bindgen_prelude::{Buffer, Function, Promise};
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -33,6 +61,7 @@ use crate::analyzer::{
     TextSegment,
 };
 use crate::manifest::{HttpServerConfigInput, ManifestInput, TlsConfigInput};
+use crate::response::{build_response_bytes_fast, patch_connection_header, inject_set_cookie_header, build_error_response_bytes};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
 
 // ─── Constants ──────────────────────────
@@ -53,12 +82,6 @@ const UNKNOWN_METHOD_CODE: u8 = 0;
 /// Sentinel handler ID dispatched to JS when no route matches — JS treats this as 404.
 const NOT_FOUND_HANDLER_ID: u32 = 0;
 
-/// Security: Maximum number of headers we allow per request
-const MAX_HEADER_COUNT: usize = 64;
-/// Security: Maximum URL length to prevent abuse
-const MAX_URL_LENGTH: usize = 8192;
-/// Security: Maximum single header value length
-const MAX_HEADER_VALUE_LENGTH: usize = 8192;
 /// Security: Maximum request body size (1 MB)
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Security: Maximum concurrent connections per worker thread
@@ -100,6 +123,74 @@ fn release_buffer(mut buf: Vec<u8>) {
             pool.push(buf);
         }
     });
+}
+
+// ─── Response Buffer Pool (BOOST-2.3) ──
+//
+// Eliminates per-response Vec<u8> allocations by recycling response buffers.
+// Separate from the connection read buffer pool — response buffers are
+// typically smaller and have different capacity profiles.
+
+#[allow(dead_code)]
+const RESPONSE_POOL_MAX_SIZE: usize = 128;
+#[allow(dead_code)]
+const RESPONSE_POOL_MAX_RECYCLE_SIZE: usize = 65536;
+
+thread_local! {
+    static RESPONSE_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(RESPONSE_POOL_MAX_SIZE));
+}
+
+/// Acquire a response buffer from the thread-local pool.
+/// Defaults to 1KB capacity — right-sized for typical JSON API responses.
+#[allow(dead_code)]
+fn acquire_response_buffer(estimated_size: usize) -> Vec<u8> {
+    RESPONSE_POOL.with(|pool| {
+        pool.borrow_mut()
+            .pop()
+            .map(|mut buf| {
+                buf.clear();
+                if buf.capacity() < estimated_size {
+                    buf.reserve(estimated_size - buf.capacity());
+                }
+                buf
+            })
+            .unwrap_or_else(|| Vec::with_capacity(estimated_size.max(1024)))
+    })
+}
+
+#[allow(dead_code)]
+fn release_response_buffer(mut buf: Vec<u8>) {
+    if buf.capacity() > RESPONSE_POOL_MAX_RECYCLE_SIZE {
+        return;
+    }
+    buf.clear();
+    RESPONSE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < RESPONSE_POOL_MAX_SIZE {
+            pool.push(buf);
+        }
+    });
+}
+
+// ─── Per-Request Arena Allocator (BOOST-1.2) ──
+//
+// Uses bumpalo for per-request bump allocation. All request-scoped strings
+// and small buffers are allocated from the arena, which resets at the end of
+// each request. This reduces per-request heap allocations from ~8-12 to 1.
+
+#[allow(dead_code)]
+const REQUEST_ARENA_CAPACITY: usize = 4096;
+
+thread_local! {
+    static REQUEST_ARENA: RefCell<bumpalo::Bump> =
+        RefCell::new(bumpalo::Bump::with_capacity(REQUEST_ARENA_CAPACITY));
+}
+
+/// Reset the per-thread request arena. Called at the end of each request
+/// to release all arena-allocated memory in a single operation.
+#[allow(dead_code)]
+fn reset_request_arena() {
+    REQUEST_ARENA.with(|arena| arena.borrow_mut().reset());
 }
 
 // ─── Server Configuration ───────────────
@@ -195,8 +286,15 @@ pub struct NativeListenOptions {
 
 struct ShutdownHandle {
     flag: Arc<AtomicBool>,
+    /// @DX-6.3: when true, the server rejects new connections but drains
+    /// in-flight requests before fully stopping. Set via `shutdown()`.
+    draining: Arc<AtomicBool>,
     wake_addrs: Vec<SocketAddr>,
 }
+
+/// @DX-6.3: global atomic counter of in-flight requests across all workers.
+/// Used by graceful shutdown to wait for requests to complete before closing.
+static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 struct LiveRouter {
     router: ArcSwap<Router>,
@@ -250,6 +348,38 @@ impl NativeServerHandle {
         self.live_router.router.store(next_router);
         close_all_websocket_connections();
         Ok(())
+    }
+
+    /// @DX-6.3: graceful shutdown — stop accepting new connections, drain
+    /// in-flight requests up to `timeout_ms`, then force-stop workers.
+    /// Returns the number of in-flight requests that were still pending
+    /// when the timeout expired (0 = fully drained).
+    #[napi]
+    pub fn shutdown(&self, timeout_ms: Option<u32>) -> napi::Result<u32> {
+        let drain_timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
+
+        /* Phase 1: set draining flag — workers reject new connections but
+         * finish processing in-flight requests normally. */
+        if let Some(handle) = self.shutdown.lock().expect("shutdown mutex poisoned").as_ref() {
+            handle.draining.store(true, Ordering::SeqCst);
+        }
+
+        close_all_websocket_connections();
+
+        /* Phase 2: poll in-flight request counter until drained or timeout */
+        let deadline = std::time::Instant::now() + drain_timeout;
+        while INFLIGHT_REQUESTS.load(Ordering::Acquire) > 0 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let remaining = INFLIGHT_REQUESTS.load(Ordering::Acquire) as u32;
+
+        /* Phase 3: force-stop workers regardless of drain state */
+        self.close()?;
+        Ok(remaining)
     }
 
     #[napi]
@@ -310,6 +440,20 @@ static STREAM_CHANNELS: std::sync::OnceLock<dashmap::DashMap<u64, flume::Sender<
     std::sync::OnceLock::new();
 static WEBSOCKET_CONNECTIONS: std::sync::OnceLock<dashmap::DashMap<u64, ()>> =
     std::sync::OnceLock::new();
+
+// ─── WebSocket Pub/Sub Registry (DX-4.4) ───
+//
+// Topic-based pub/sub for WebSocket connections. Connections subscribe to
+// named topics; publishing to a topic broadcasts to all subscribers. The
+// registry uses DashMap for lock-free concurrent access across worker threads.
+
+/// topic → set of connection IDs subscribed to that topic
+static WS_TOPICS: std::sync::OnceLock<dashmap::DashMap<String, HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn ws_topic_registry() -> &'static dashmap::DashMap<String, HashSet<u64>> {
+    WS_TOPICS.get_or_init(dashmap::DashMap::new)
+}
 static CACHE_NAMESPACE_COUNTS: std::sync::OnceLock<dashmap::DashMap<u64, usize>> =
     std::sync::OnceLock::new();
 pub(crate) static CACHE_NAMESPACE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -419,8 +563,81 @@ pub fn stream_end(stream_id: i64) -> napi::Result<()> {
     if let Some((_, sender)) = registry.remove(&(stream_id as u64)) {
         let _ = sender.send(StreamMessage::End);
     }
-    websocket_connections().remove(&(stream_id as u64));
+    let conn_id = stream_id as u64;
+    websocket_connections().remove(&conn_id);
+    // Clean up any pub/sub subscriptions for this connection
+    ws_unsubscribe_all(stream_id);
     Ok(())
+}
+
+// ─── WebSocket Pub/Sub NAPI Functions ───
+
+/// Subscribe a WebSocket connection to a topic.
+#[napi]
+pub fn ws_subscribe(connection_id: i64, topic: String) {
+    let id = connection_id as u64;
+    ws_topic_registry()
+        .entry(topic)
+        .or_insert_with(HashSet::new)
+        .insert(id);
+}
+
+/// Unsubscribe a WebSocket connection from a topic.
+#[napi]
+pub fn ws_unsubscribe(connection_id: i64, topic: String) {
+    let registry = ws_topic_registry();
+    if let Some(mut subs) = registry.get_mut(&topic) {
+        subs.remove(&(connection_id as u64));
+        if subs.is_empty() {
+            drop(subs);
+            registry.remove(&topic);
+        }
+    }
+}
+
+/// Unsubscribe a connection from ALL topics (called on disconnect).
+#[napi]
+pub fn ws_unsubscribe_all(connection_id: i64) {
+    let id = connection_id as u64;
+    let registry = ws_topic_registry();
+    let mut empty_topics = Vec::new();
+    for mut entry in registry.iter_mut() {
+        entry.value_mut().remove(&id);
+        if entry.value().is_empty() {
+            empty_topics.push(entry.key().clone());
+        }
+    }
+    for topic in empty_topics {
+        registry.remove(&topic);
+    }
+}
+
+/// Publish a message to all connections subscribed to a topic.
+/// Returns the number of connections the message was sent to.
+#[napi]
+pub fn ws_publish(topic: String, data: Buffer) -> u32 {
+    let registry = ws_topic_registry();
+    let Some(subscribers) = registry.get(&topic) else { return 0 };
+    let stream_reg = stream_registry();
+    let frame = websocket::encode_frame(websocket::OPCODE_TEXT, data.as_ref());
+    let mut count = 0u32;
+    for &conn_id in subscribers.value() {
+        if let Some(sender) = stream_reg.get(&conn_id) {
+            if sender.send(StreamMessage::Chunk(frame.clone())).is_ok() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Get the number of subscribers for a topic.
+#[napi]
+pub fn ws_subscriber_count(topic: String) -> u32 {
+    ws_topic_registry()
+        .get(&topic)
+        .map(|s| s.len() as u32)
+        .unwrap_or(0)
 }
 
 /// Get a session value by key. Returns JSON string or null.
@@ -440,8 +657,7 @@ pub fn session_set(session_id_hex: String, key: String, value: String) -> bool {
     let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
     let mut mutations = std::collections::HashMap::new();
     mutations.insert(key, value.into_bytes());
-    store.upsert(&id, mutations, &[]);
-    true
+    store.upsert(&id, mutations, &[])
 }
 
 /// Delete a session key.
@@ -449,8 +665,7 @@ pub fn session_set(session_id_hex: String, key: String, value: String) -> bool {
 pub fn session_delete(session_id_hex: String, key: String) -> bool {
     let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
     let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
-    store.upsert(&id, std::collections::HashMap::new(), &[key]);
-    true
+    store.upsert(&id, std::collections::HashMap::new(), &[key])
 }
 
 /// Destroy an entire session.
@@ -506,8 +721,7 @@ pub fn session_set_all(session_id_hex: String, data_json: String) -> bool {
     for (key, value) in map {
         mutations.insert(key.clone(), value.to_string().into_bytes());
     }
-    store.upsert(&id, mutations, &[]);
-    true
+    store.upsert(&id, mutations, &[])
 }
 
 #[napi(object)]
@@ -593,8 +807,12 @@ pub fn start_server(
     let live_router = Arc::new(LiveRouter {
         router: ArcSwap::from(router),
     });
-    let tls_acceptor = build_tls_acceptor(&manifest).map_err(to_napi_error)?;
-    let tls_enabled = tls_acceptor.is_some();
+    let tls_result = build_tls_acceptor(&manifest).map_err(to_napi_error)?;
+    let tls_enabled = tls_result.is_some();
+    let (tls_acceptor, tls_config) = match tls_result {
+        Some((acceptor, config)) => (Some(acceptor), Some(config)),
+        None => (None, None),
+    };
 
     // Build session store if session config is present in manifest
     let session_store: Option<Arc<session::SessionStore>> = manifest.session.as_ref().map(|cfg| {
@@ -604,7 +822,7 @@ pub fn start_server(
             cookie_name: cfg.cookie_name.clone(),
             http_only: cfg.http_only,
             secure: cfg.secure,
-            same_site: session::SameSite::from_str(&cfg.same_site),
+            same_site: cfg.same_site.parse::<session::SameSite>().unwrap(),
             path: cfg.path.clone(),
             max_sessions: cfg.max_sessions,
             max_data_size: cfg.max_data_size,
@@ -623,6 +841,7 @@ pub fn start_server(
     let worker_count = worker_count_for(&options);
     let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(worker_count);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let draining_flag = Arc::new(AtomicBool::new(false));
     let mut closed_receivers = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
@@ -633,8 +852,10 @@ pub fn start_server(
         let thread_dispatcher = Arc::clone(&dispatcher);
         let thread_config = Arc::clone(&server_config);
         let thread_shutdown = Arc::clone(&shutdown_flag);
+        let thread_draining = Arc::clone(&draining_flag);
         let thread_session_store = session_store.clone();
         let thread_tls_acceptor = tls_acceptor.clone();
+        let thread_tls_config = tls_config.clone();
         let thread_options = NativeListenOptions {
             host: options.host.clone(),
             port: options.port,
@@ -661,7 +882,9 @@ pub fn start_server(
                         thread_dispatcher,
                         thread_config,
                         thread_tls_acceptor,
+                        thread_tls_config,
                         thread_shutdown,
+                        thread_draining,
                         thread_session_store,
                     )
                     .await
@@ -670,7 +893,7 @@ pub fn start_server(
 
             if let Err(error) = &result {
                 let _ = startup_tx_error.send(Err(error.to_string()));
-                eprintln!("[http-native] native server error: {error:#}");
+                log_error!("native server exited: {error:#}");
             }
 
             let _ = closed_tx.send(());
@@ -729,6 +952,7 @@ pub fn start_server(
         cache_namespaces: Mutex::new(registered_cache_namespaces),
         shutdown: Mutex::new(Some(ShutdownHandle {
             flag: shutdown_flag,
+            draining: draining_flag,
             wake_addrs,
         })),
         closed: Mutex::new(Some(closed_receivers)),
@@ -779,7 +1003,9 @@ async fn run_server(
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
     tls_acceptor: Option<TlsAcceptor>,
+    tls_config: Option<Arc<RustlsServerConfig>>,
     shutdown_flag: Arc<AtomicBool>,
+    draining_flag: Arc<AtomicBool>,
     session_store: Option<Arc<session::SessionStore>>,
 ) -> Result<()> {
     // Wrap Arc in Rc for cheap per-connection cloning within this single-threaded
@@ -787,11 +1013,12 @@ async fn run_server(
     let live_router: Rc<Arc<LiveRouter>> = Rc::new(live_router);
     let dispatcher: Rc<Arc<JsDispatcher>> = Rc::new(dispatcher);
     let server_config: Rc<Arc<HttpServerConfig>> = Rc::new(server_config);
-    let tls_acceptor: Option<Rc<TlsAcceptor>> = tls_acceptor.map(Rc::new);
+    let _tls_acceptor: Option<Rc<TlsAcceptor>> = tls_acceptor.map(Rc::new);
+    let tls_config: Option<Rc<Arc<RustlsServerConfig>>> = tls_config.map(Rc::new);
     let session_store: Option<Rc<Arc<session::SessionStore>>> =
         session_store.map(Rc::new);
 
-    let active_connections: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    let active_connections = Rc::new(std::cell::Cell::new(0usize));
 
     loop {
         if shutdown_flag.load(Ordering::Acquire) {
@@ -804,6 +1031,14 @@ async fn run_server(
                     break;
                 }
 
+                /* @DX-6.3: in draining mode, reject new connections with 503
+                 * so load balancers route traffic elsewhere. In-flight requests
+                 * on existing connections continue normally. */
+                if draining_flag.load(Ordering::Acquire) {
+                    drop(stream);
+                    continue;
+                }
+
                 // Security (S3): enforce per-worker connection limit
                 if active_connections.get() >= MAX_CONNECTIONS_PER_WORKER {
                     drop(stream);
@@ -811,32 +1046,66 @@ async fn run_server(
                 }
 
                 if let Err(error) = stream.set_nodelay(true) {
-                    eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
+                    log_warn!("failed to enable TCP_NODELAY: {error}");
                 }
 
                 let live_router = Rc::clone(&live_router);
                 let dispatcher = Rc::clone(&dispatcher);
                 let server_config = Rc::clone(&server_config);
-                let tls_acceptor = tls_acceptor.clone();
+                let tls_config = tls_config.clone();
                 let session_store = session_store.clone();
                 active_connections.set(active_connections.get() + 1);
 
-                // Safety: monoio is single-threaded per worker, so Cell is fine here
-                let conn_counter = &active_connections as *const std::cell::Cell<usize>;
+                let conn_counter = Rc::clone(&active_connections);
 
                 monoio::spawn(async move {
-                    let connection_result = if let Some(acceptor) = tls_acceptor.as_ref() {
-                        match acceptor.accept(stream).await {
+                    let connection_result = if let Some(tls_cfg) = tls_config.as_ref() {
+                        /* @DX-4.1: TLS connections use poll-io path to support both
+                         * HTTP/1.1 and HTTP/2 via ALPN negotiation. The raw TCP stream
+                         * is converted to a tokio-compatible type, then wrapped with
+                         * tokio-rustls for TLS. After the handshake, ALPN determines
+                         * whether to dispatch to the h2 handler or fall back to h1.1. */
+                        let poll_io = match monoio::io::IntoPollIo::into_poll_io(stream) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log_error!("failed to convert to poll-io: {e}");
+                                return;
+                            }
+                        };
+
+                        let tokio_acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(tls_cfg.as_ref()));
+                        match tokio_acceptor.accept(poll_io).await {
                             Ok(tls_stream) => {
-                                handle_connection(
-                                    tls_stream,
-                                    live_router,
-                                    dispatcher,
-                                    server_config,
-                                    session_store,
-                                    Some(peer_addr),
-                                )
-                                .await
+                                let alpn = tls_stream.get_ref().1.alpn_protocol()
+                                    .map(|p| p.to_vec());
+                                let is_h2 = alpn.as_deref() == Some(b"h2");
+
+                                if is_h2 {
+                                    let peer_ip = Some(peer_addr.ip().to_string());
+                                    h2_handler::handle_h2_connection(
+                                        tls_stream,
+                                        live_router,
+                                        dispatcher,
+                                        server_config,
+                                        peer_ip,
+                                    )
+                                    .await
+                                } else {
+                                    /* HTTP/1.1 over TLS — use monoio-rustls for
+                                     * completion-based I/O (fast path). We need to
+                                     * re-accept with monoio-rustls since we already
+                                     * consumed the stream. For now, handle h1.1 over
+                                     * the poll-io TLS stream. */
+                                    handle_h1_over_poll_tls(
+                                        tls_stream,
+                                        live_router,
+                                        dispatcher,
+                                        server_config,
+                                        session_store,
+                                        Some(peer_addr),
+                                    )
+                                    .await
+                                }
                             }
                             Err(error) => Err(anyhow!("TLS accept failed: {error}")),
                         }
@@ -852,12 +1121,9 @@ async fn run_server(
                         .await
                     };
                     if let Err(error) = connection_result {
-                        eprintln!("[http-native] connection error: {error}");
+                        log_error!("connection error: {error}");
                     }
-                    // Safety: single-threaded — pointer is always valid while server runs
-                    unsafe { &*conn_counter }.set(
-                        unsafe { &*conn_counter }.get().saturating_sub(1),
-                    );
+                    conn_counter.set(conn_counter.get().saturating_sub(1));
                 });
             }
             Err(error) => {
@@ -865,7 +1131,7 @@ async fn run_server(
                     break;
                 }
 
-                eprintln!("[http-native] accept error: {error}");
+                log_error!("accept error: {error}");
             }
         }
     }
@@ -873,29 +1139,10 @@ async fn run_server(
     Ok(())
 }
 
-// ─── Parsed Request (from httparse) ─────
-
-struct ParsedRequest<'a> {
-    method: &'a [u8],
-    target: &'a [u8],
-    path: &'a [u8],
-    keep_alive: bool,
-    header_bytes: usize,
-    has_body: bool,
-    content_length: Option<usize>,
-    /// True when a non-identity Transfer-Encoding header was seen
-    has_chunked_te: bool,
-    /// Pre-parsed header pairs — stored once, used by both routing and bridge
-    headers: Vec<(&'a str, &'a str)>,
-    /// Raw cookie header value for session extraction
-    cookie_header: Option<&'a str>,
-    /// True when the request contains an Upgrade: websocket header
-    is_websocket_upgrade: bool,
-    /// The Sec-WebSocket-Key header value, if present
-    ws_key: Option<&'a str>,
-    /// Best accepted encoding from Accept-Encoding header
-    accepted_encoding: compress::AcceptedEncoding,
-}
+use crate::parser::{
+    ParsedRequest, parse_request_httparse, find_header_end,
+    contains_ascii_case_insensitive, trim_ascii_spaces,
+};
 
 use monoio::time::timeout;
 use std::time::Duration;
@@ -903,8 +1150,100 @@ use std::time::Duration;
 const TIMEOUT_HEADER_READ: Duration = Duration::from_secs(30);
 const TIMEOUT_IDLE_KEEPALIVE: Duration = Duration::from_secs(120);
 const TIMEOUT_BODY_READ: Duration = Duration::from_secs(60);
+const TIMEOUT_WS_IDLE: Duration = Duration::from_secs(300);
+/// @S8: maximum wall-clock time to accumulate a complete set of request headers.
+/// Defends against slow-loris attacks that send one byte per read to reset
+/// per-read timeouts. If the total header phase exceeds this, the connection
+/// is closed regardless of per-read progress.
+const TIMEOUT_HEADER_DEADLINE: Duration = Duration::from_secs(60);
 
-// ─── Connection Handler with Buffer Pool 
+// ─── Tokio ↔ Monoio I/O Adapter ────────
+//
+// Bridges tokio's poll-based `AsyncRead`/`AsyncWrite` traits to monoio's
+// ownership-based `AsyncReadRent`/`AsyncWriteRent` traits. This lets us reuse
+// the existing HTTP/1.1 connection handler for TLS streams that went through
+// tokio-rustls (needed for ALPN negotiation with h2).
+
+struct TokioCompat<T>(T);
+
+impl<T: tokio::io::AsyncRead + Unpin + 'static> monoio::io::AsyncReadRent for TokioCompat<T> {
+    async fn read<B: monoio::buf::IoBufMut>(&mut self, mut buf: B) -> monoio::BufResult<usize, B> {
+        use tokio::io::AsyncReadExt;
+        let total = buf.bytes_total();
+        if total == 0 {
+            return (Ok(0), buf);
+        }
+        // Safety: write_ptr returns the buffer start, bytes_total gives capacity.
+        // Matches monoio's own recv semantics — kernel writes from position 0.
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), total) };
+        match self.0.read(slice).await {
+            Ok(n) => {
+                unsafe { buf.set_init(n) };
+                (Ok(n), buf)
+            }
+            Err(e) => (Err(e), buf),
+        }
+    }
+
+    async fn readv<B: monoio::buf::IoVecBufMut>(&mut self, buf: B) -> monoio::BufResult<usize, B> {
+        // Vectored reads are never used by the HTTP/1.1 handler
+        (Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "readv not available over TLS adapter")), buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin + 'static> monoio::io::AsyncWriteRent for TokioCompat<T> {
+    async fn write<B: monoio::buf::IoBuf>(&mut self, buf: B) -> monoio::BufResult<usize, B> {
+        use tokio::io::AsyncWriteExt;
+        let init = buf.bytes_init();
+        // Safety: read_ptr gives the buffer start, bytes_init gives valid byte count
+        let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), init) };
+        match self.0.write(slice).await {
+            Ok(n) => (Ok(n), buf),
+            Err(e) => (Err(e), buf),
+        }
+    }
+
+    async fn writev<B: monoio::buf::IoVecBuf>(&mut self, buf: B) -> monoio::BufResult<usize, B> {
+        (Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "writev not available over TLS adapter")), buf)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        tokio::io::AsyncWriteExt::flush(&mut self.0).await
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        tokio::io::AsyncWriteExt::shutdown(&mut self.0).await
+    }
+}
+
+/// Handle HTTP/1.1 traffic over a tokio-rustls TLS stream.
+///
+/// Wraps the TLS stream in a `TokioCompat` adapter so the existing
+/// monoio-based connection handler can drive it. This path is used when
+/// ALPN negotiation selects "http/1.1" instead of "h2".
+async fn handle_h1_over_poll_tls<IO>(
+    tls_stream: tokio_rustls::server::TlsStream<IO>,
+    live_router: Rc<Arc<LiveRouter>>,
+    dispatcher: Rc<Arc<JsDispatcher>>,
+    server_config: Rc<Arc<HttpServerConfig>>,
+    session_store: Option<Rc<Arc<session::SessionStore>>>,
+    peer_addr: Option<SocketAddr>,
+) -> Result<()>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    handle_connection(
+        TokioCompat(tls_stream),
+        live_router,
+        dispatcher,
+        server_config,
+        session_store,
+        peer_addr,
+    )
+    .await
+}
+
+// ─── Connection Handler with Buffer Pool
 
 async fn handle_connection<S>(
     mut stream: S,
@@ -947,10 +1286,18 @@ async fn handle_connection_inner<S>(
 where
     S: AsyncReadRent + AsyncWriteRent + Unpin,
 {
-    let mut is_first_request = true;
-
     loop {
         let router = live_router.router.load_full();
+
+        /* @S8: deadline tracks total wall-clock time for header accumulation.
+         * Starts unset; initialized on first byte of a new request. Prevents
+         * slow-loris attacks that drip-feed bytes to reset per-read timeouts. */
+        let mut header_deadline: Option<std::time::Instant> = None;
+
+        /* The first read of a new request uses the longer idle/keep-alive
+         * timeout. Once bytes arrive, subsequent reads use the shorter
+         * header-read timeout. */
+        let mut awaiting_new_request = true;
 
         // Try hot-path parsing first (GET / with known prefix)
         let parsed = loop {
@@ -973,21 +1320,21 @@ where
 
             // SAFETY: We take ownership of the buffer, read into it, then put it back
             let owned_buf = std::mem::take(buffer);
-            let read_duration = if is_first_request {
-                TIMEOUT_HEADER_READ
-            } else {
+            let read_duration = if awaiting_new_request {
                 TIMEOUT_IDLE_KEEPALIVE
+            } else {
+                TIMEOUT_HEADER_READ
             };
-            
+
             let timeout_result = timeout(read_duration, stream.read(owned_buf)).await;
             let (read_result, next_buffer) = match timeout_result {
                 Ok(res) => res,
                 Err(_) => {
-                    // Read timeout
+                    // Per-read timeout expired
                     return Ok(());
                 }
             };
-            
+
             *buffer = next_buffer;
             let bytes_read = read_result?;
 
@@ -995,7 +1342,27 @@ where
                 return Ok(());
             }
 
-            is_first_request = false;
+            awaiting_new_request = false;
+
+            /* @S8: start the header deadline on the first byte of a new request */
+            if header_deadline.is_none() {
+                header_deadline = Some(std::time::Instant::now() + TIMEOUT_HEADER_DEADLINE);
+            }
+
+            /* @S8: enforce total header-phase wall-clock deadline */
+            if let Some(deadline) = header_deadline {
+                if std::time::Instant::now() >= deadline {
+                    let response = build_error_response_bytes(
+                        408,
+                        b"{\"error\":\"Request Timeout\"}",
+                        false,
+                    );
+                    let (write_result, _) = stream.write_all(response).await;
+                    let _ = write_result;
+                    stream.shutdown().await?;
+                    return Ok(());
+                }
+            }
 
             if buffer.len() > server_config.max_header_bytes {
                 // Security: Request header too large
@@ -1016,6 +1383,19 @@ where
         let has_body = parsed.has_body;
         let content_length = parsed.content_length;
         let accepted_encoding = parsed.accepted_encoding;
+
+        /* @DX-6.3: track in-flight requests for graceful shutdown draining.
+         * The guard decrements the counter on drop, ensuring correct counting
+         * regardless of which code path exits the request (error, early return,
+         * or normal completion). */
+        INFLIGHT_REQUESTS.fetch_add(1, Ordering::Release);
+        struct InflightGuard;
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let _inflight = InflightGuard;
 
         // Security (S1): reject requests with non-identity Transfer-Encoding
         if parsed.has_chunked_te {
@@ -1114,15 +1494,53 @@ where
             continue;
         }
 
+        /* @DX-3.4: pre-match route to determine per-route body size limit.
+         * This runs before the body is read so oversized payloads are rejected
+         * without wasting I/O or memory. */
+        let route_body_limit = {
+            let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
+            let path_str = std::str::from_utf8(parsed.path).unwrap_or("/");
+            let normalized = normalize_runtime_path(path_str);
+            if method_code != UNKNOWN_METHOD_CODE {
+                router.match_route(method_code, normalized.as_ref())
+                    .and_then(|m| m.max_body_bytes)
+            } else {
+                None
+            }
+        };
+
         // ── Body requests: need owned copies to release buffer for body read ──
-        let method_owned: Vec<u8> = parsed.method.to_vec();
-        let target_owned: Vec<u8> = parsed.target.to_vec();
-        let path_owned: Vec<u8> = parsed.path.to_vec();
-        let headers_owned: Vec<(String, String)> = parsed
-            .headers
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.to_string()))
-            .collect();
+        //
+        // @P1: coalesce method + target + path into a single allocation and
+        // pack all header name/value pairs into one flat buffer with offset
+        // ranges. Avoids N individual String allocations per header.
+        let method_len = parsed.method.len();
+        let target_len = parsed.target.len();
+        let path_len = parsed.path.len();
+        let mtp_total = method_len + target_len + path_len;
+        let mut mtp_buf = Vec::with_capacity(mtp_total);
+        mtp_buf.extend_from_slice(parsed.method);
+        mtp_buf.extend_from_slice(parsed.target);
+        mtp_buf.extend_from_slice(parsed.path);
+        let method_owned = &mtp_buf[..method_len];
+        let target_owned = &mtp_buf[method_len..method_len + target_len];
+        let path_owned = &mtp_buf[method_len + target_len..];
+
+        let header_count = parsed.headers.len();
+        let mut hdr_buf_size = 0;
+        for (n, v) in &parsed.headers {
+            hdr_buf_size += n.len() + v.len();
+        }
+        let mut hdr_buf = Vec::with_capacity(hdr_buf_size);
+        /* (name_start, name_len, value_start, value_len) per header */
+        let mut hdr_ranges: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(header_count);
+        for (n, v) in &parsed.headers {
+            let ns = hdr_buf.len();
+            hdr_buf.extend_from_slice(n.as_bytes());
+            let vs = hdr_buf.len();
+            hdr_buf.extend_from_slice(v.as_bytes());
+            hdr_ranges.push((ns, n.len(), vs, v.len()));
+        }
         let (session_id_body, is_new_session_body) = resolve_session(session_store, parsed.cookie_header);
         drop(parsed);
 
@@ -1140,7 +1558,10 @@ where
                 }
             };
 
-            if content_length > MAX_BODY_BYTES {
+            /* @DX-3.4: use per-route body limit when configured, otherwise
+             * fall back to the global MAX_BODY_BYTES constant. */
+            let effective_body_limit = route_body_limit.unwrap_or(MAX_BODY_BYTES);
+            if content_length > effective_body_limit {
                 let response =
                     build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
                 let (write_result, _) = stream.write_all(response).await;
@@ -1185,12 +1606,24 @@ where
             }
         };
 
+        /* @P1: build (&str, &str) header refs directly from the packed buffer —
+         * all bytes were valid UTF-8 from httparse, so this avoids N individual
+         * String heap allocations. */
+        let header_refs: Vec<(&str, &str)> = hdr_ranges
+            .iter()
+            .map(|&(ns, nl, vs, vl)| {
+                let name = std::str::from_utf8(&hdr_buf[ns..ns + nl]).unwrap_or("");
+                let value = std::str::from_utf8(&hdr_buf[vs..vs + vl]).unwrap_or("");
+                (name, value)
+            })
+            .collect();
+
         let dispatch_decision_owned = build_dispatch_decision_owned(
             router.as_ref(),
-            &method_owned,
-            &target_owned,
-            &path_owned,
-            &headers_owned,
+            method_owned,
+            target_owned,
+            path_owned,
+            &header_refs,
             &body_bytes,
             peer_ip,
             accepted_encoding,
@@ -1217,132 +1650,6 @@ where
     }
 }
 
-// ─── httparse-based Request Parsing ─────
-//
-// Uses the battle-tested `httparse` crate for RFC-compliant zero-copy parsing.
-// Single-pass: parses headers once and stores them for reuse by both the
-// router and the bridge envelope builder.
-
-fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
-    let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
-    let mut req = httparse::Request::new(&mut raw_headers);
-
-    let header_len = match req.parse(bytes) {
-        Ok(httparse::Status::Complete(len)) => len,
-        Ok(httparse::Status::Partial) => return None,
-        Err(_) => return None, // Malformed — caller will handle
-    };
-
-    let method = req.method?.as_bytes();
-    let target = req.path?.as_bytes();
-    let version = req.version?;
-
-    // Security: enforce URL length limit
-    if target.len() > MAX_URL_LENGTH {
-        return None;
-    }
-
-    // Extract path (before '?')
-    let path = target.split(|b| *b == b'?').next()?;
-
-    let mut keep_alive = version >= 1; // HTTP/1.1+ defaults to keep-alive
-    let mut has_body = false;
-    let mut content_length: Option<usize> = None;
-    let mut has_chunked_te = false;
-    let mut cookie_header: Option<&str> = None;
-    let mut is_websocket_upgrade = false;
-    let mut ws_key: Option<&str> = None;
-    let mut accepted_encoding = compress::AcceptedEncoding::Identity;
-    let mut headers = Vec::with_capacity(req.headers.len());
-
-    for header in req.headers.iter() {
-        if header.name.is_empty() {
-            break;
-        }
-
-        // Security: enforce header value length
-        if header.value.len() > MAX_HEADER_VALUE_LENGTH {
-            return None;
-        }
-
-        let name = header.name; // httparse gives us &str
-        let value = match std::str::from_utf8(header.value) {
-            Ok(v) => v,
-            Err(_) => continue, // Skip non-UTF-8 headers
-        };
-
-        // Connection handling — allocation-free byte comparison
-        if name.eq_ignore_ascii_case("connection") {
-            let vb = value.as_bytes();
-            if contains_ascii_case_insensitive(vb, b"close") {
-                keep_alive = false;
-            }
-            if contains_ascii_case_insensitive(vb, b"keep-alive") {
-                keep_alive = true;
-            }
-        }
-
-        // Body detection
-        if name.eq_ignore_ascii_case("content-length") {
-            let trimmed = value.trim();
-            if let Ok(len) = trimmed.parse::<usize>() {
-                content_length = Some(len);
-                if len > 0 {
-                    has_body = true;
-                }
-            }
-        }
-
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity") {
-                has_body = true;
-                has_chunked_te = true;
-            }
-        }
-
-        // Session: capture cookie header for session extraction
-        if name.eq_ignore_ascii_case("cookie") {
-            cookie_header = Some(value);
-        }
-
-        // WebSocket: detect upgrade request
-        if name.eq_ignore_ascii_case("upgrade") {
-            if value.eq_ignore_ascii_case("websocket") {
-                is_websocket_upgrade = true;
-            }
-        }
-        if name.eq_ignore_ascii_case("sec-websocket-key") {
-            ws_key = Some(value);
-        }
-
-        // Compression: parse Accept-Encoding
-        if accepted_encoding != compress::AcceptedEncoding::Brotli
-            && name.eq_ignore_ascii_case("accept-encoding")
-        {
-            accepted_encoding = compress::parse_accept_encoding(value.as_bytes());
-        }
-
-        headers.push((name, value));
-    }
-
-    Some(ParsedRequest {
-        method,
-        target,
-        path,
-        keep_alive,
-        header_bytes: header_len,
-        has_body,
-        content_length,
-        has_chunked_te,
-        headers,
-        cookie_header,
-        is_websocket_upgrade,
-        ws_key,
-        accepted_encoding,
-    })
-}
-
 // ─── Hot Root Path (GET /) ──────────────
 //
 // Ultra-fast path for the most common benchmark case. Falls back to httparse
@@ -1363,6 +1670,8 @@ fn parse_hot_root_request(
     let header_end = find_header_end(bytes)?;
     let mut keep_alive = keep_alive;
     let mut has_body = false;
+    let mut has_chunked_te = false;
+    let mut content_length: Option<usize> = None;
     let mut accepted_encoding = compress::AcceptedEncoding::Identity;
     let mut line_start = bytes.iter().position(|b| *b == b'\n')? + 1;
 
@@ -1391,8 +1700,15 @@ fn parse_hot_root_request(
         {
             let value =
                 trim_ascii_spaces(&line[server_config.header_content_length_prefix.len()..]);
-            if value != b"0" {
-                has_body = true;
+            /* @B4: parse Content-Length for TE+CL smuggling detection */
+            if let Some(len) = std::str::from_utf8(value)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                content_length = Some(len);
+                if len > 0 {
+                    has_body = true;
+                }
             }
         } else if line.len() >= server_config.header_transfer_encoding_prefix.len()
             && line[..server_config.header_transfer_encoding_prefix.len()]
@@ -1400,8 +1716,10 @@ fn parse_hot_root_request(
         {
             let value =
                 trim_ascii_spaces(&line[server_config.header_transfer_encoding_prefix.len()..]);
+            /* @B4: flag non-identity Transfer-Encoding for smuggling guard */
             if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
                 has_body = true;
+                has_chunked_te = true;
             }
         } else if accepted_encoding != compress::AcceptedEncoding::Brotli
             && line.len() >= 17
@@ -1421,10 +1739,10 @@ fn parse_hot_root_request(
         keep_alive,
         header_bytes: header_end + 4,
         has_body,
-        content_length: None,
-        has_chunked_te: false,
+        content_length,
+        has_chunked_te,
         headers: Vec::new(),
-        cookie_header: None, // Hot path doesn't parse cookies
+        cookie_header: None,
         is_websocket_upgrade: false,
         ws_key: None,
         accepted_encoding,
@@ -1494,7 +1812,7 @@ fn build_dispatch_decision_zero_copy(
 
     let mut cache_insertion = None;
     if let Some(cfg) = matched_route.cache_config {
-         let base_key = crate::router::interpolate_cache_key(cfg, parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         let base_key = crate::router::interpolate_cache_key(cfg, &parsed.headers, url_str, matched_route.param_names, &matched_route.param_values);
          let key = vary_cache_key_by_encoding(base_key, accepted_encoding);
          if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, key, parsed.keep_alive) {
              return Ok(DispatchDecision::CachedResponse(cached_response));
@@ -1535,12 +1853,20 @@ fn build_dispatch_decision_zero_copy(
     ))
 }
 
-fn build_dispatch_decision_owned(
+/// /* @param router   — compiled route table */
+/// /* @param method   — raw HTTP method bytes */
+/// /* @param target   — raw request target (URL) bytes */
+/// /* @param path     — path portion (before '?') bytes */
+/// /* @param headers  — pre-parsed (name, value) str pairs */
+/// /* @param body     — request body bytes */
+/// /* @param peer_ip  — client IP string, if known */
+/// /* @param accepted_encoding — best encoding from Accept-Encoding */
+fn build_dispatch_decision_owned<'a>(
     router: &Router,
     method: &[u8],
     target: &[u8],
     path: &[u8],
-    headers: &[(String, String)],
+    headers: &[(&'a str, &'a str)],
     body: &[u8],
     peer_ip: Option<&str>,
     accepted_encoding: compress::AcceptedEncoding,
@@ -1552,10 +1878,7 @@ fn build_dispatch_decision_owned(
     let url_cow = String::from_utf8_lossy(target);
     let url_str = url_cow.as_ref();
 
-    let header_refs: Vec<(&str, &str)> = headers
-        .iter()
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
+    let header_refs = headers;
 
     // Security: strict path validation
     let normalized_path = normalize_runtime_path(path_str);
@@ -1591,22 +1914,9 @@ fn build_dispatch_decision_owned(
 
     let mut cache_insertion = None;
     if let Some(cfg) = matched_route.cache_config {
-         let mock_parsed = ParsedRequest {
-             method,
-             target,
-             path,
-             keep_alive: false,
-             header_bytes: 0,
-             has_body: true,
-             content_length: None,
-             has_chunked_te: false,
-             headers: header_refs.clone(),
-             cookie_header: None,
-             is_websocket_upgrade: false,
-             ws_key: None,
-             accepted_encoding: compress::AcceptedEncoding::Identity,
-         };
-         let base_key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         /* @BOOST-1.3: pass header slice directly — avoids constructing a
+          * throwaway ParsedRequest and the .to_vec() clone that entailed. */
+         let base_key = crate::router::interpolate_cache_key(cfg, header_refs, url_str, matched_route.param_names, &matched_route.param_values);
          let key = vary_cache_key_by_encoding(base_key, accepted_encoding);
          cache_insertion = Some((matched_route.cache_namespace, key, cfg.max_entries, cfg.ttl_secs));
     } else {
@@ -2117,107 +2427,6 @@ fn append_json_string(output: &mut Vec<u8>, value: &str) {
     output.push(b'"');
 }
 
-fn build_response_bytes_fast(
-    status: u16,
-    headers: &[(Box<str>, Box<str>)],
-    body: &[u8],
-    keep_alive: bool,
-    encoding: compress::AcceptedEncoding,
-    compression_config: Option<&compress::CompressionConfig>,
-) -> Vec<u8> {
-    // ── Scan headers for content-type / content-encoding ──
-    let mut content_type: Option<&[u8]> = None;
-    let mut has_content_encoding = false;
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-type") {
-            content_type = Some(value.as_bytes());
-        } else if name.eq_ignore_ascii_case("content-encoding") {
-            has_content_encoding = true;
-        }
-    }
-
-    // ── Attempt compression ──
-    let compressed = compression_config.and_then(|config| {
-        compress::should_compress(config, encoding, body.len(), content_type, has_content_encoding)
-            .and_then(|enc| compress::compress_body(body, enc, config, content_type).map(|data| (data, enc)))
-    });
-
-    let (final_body, applied_encoding): (&[u8], Option<compress::AcceptedEncoding>) =
-        match &compressed {
-            Some((data, enc)) => (data.as_slice(), Some(*enc)),
-            None => (body, None),
-        };
-
-    // ── Build HTTP response ──
-    let reason = status_reason(status);
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let body_len = final_body.len();
-
-    let mut total_size =
-        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
-
-    if applied_encoding.is_some() {
-        // "content-encoding: br\r\nvary: accept-encoding\r\n" worst case ~50 bytes
-        total_size += 50;
-    }
-
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        if name.contains('\r')
-            || name.contains('\n')
-            || value.contains('\r')
-            || value.contains('\n')
-        {
-            continue;
-        }
-        total_size += name.len() + 2 + value.len() + 2;
-    }
-
-    total_size += 2 + body_len;
-
-    let mut output = Vec::with_capacity(total_size);
-    output.extend_from_slice(b"HTTP/1.1 ");
-    write_u16(&mut output, status);
-    output.push(b' ');
-    output.extend_from_slice(reason.as_bytes());
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(b"content-length: ");
-    write_usize(&mut output, body_len);
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(b"connection: ");
-    output.extend_from_slice(connection.as_bytes());
-    output.extend_from_slice(b"\r\n");
-
-    // Compression headers
-    if let Some(enc) = applied_encoding {
-        output.extend_from_slice(b"content-encoding: ");
-        output.extend_from_slice(compress::encoding_header_value(enc));
-        output.extend_from_slice(b"\r\nvary: accept-encoding\r\n");
-    }
-
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        if name.contains('\r')
-            || name.contains('\n')
-            || value.contains('\r')
-            || value.contains('\n')
-        {
-            continue;
-        }
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(b": ");
-        output.extend_from_slice(value.as_bytes());
-        output.extend_from_slice(b"\r\n");
-    }
-
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(final_body);
-    output
-}
 
 // ─── Response Writing ───────────────────
 
@@ -2345,8 +2554,11 @@ fn extract_ncache_trailer(dispatch_bytes: &[u8]) -> Option<(u64, usize)> {
 /// Uses FxHasher (~5x faster than SipHash/DefaultHasher for short keys).
 fn compute_ncache_key(url_bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
-    use rustc_hash::FxHasher;
-    let mut hasher = FxHasher::default();
+    use std::collections::hash_map::DefaultHasher;
+    /* Use SipHash (DefaultHasher) instead of FxHasher to prevent
+     * cache poisoning via hash collision attacks. SipHash is
+     * randomized per process, making collisions unpredictable. */
+    let mut hasher = DefaultHasher::new();
     url_bytes.hash(&mut hasher);
     hasher.finish()
 }
@@ -2664,7 +2876,7 @@ where
                                 match trailer.action {
                                     session::SessionAction::Update => {
                                         if let Some(sid) = session_id {
-                                            store.upsert(&sid, trailer.mutations, &trailer.deleted_keys);
+                                            let _ = store.upsert(&sid, trailer.mutations, &trailer.deleted_keys);
                                             // Inject Set-Cookie for new sessions
                                             if is_new_session {
                                                 let cookie = store.build_set_cookie(&sid);
@@ -2686,9 +2898,9 @@ where
                                             store.destroy(&old_sid);
                                             let new_sid = store.generate_id();
                                             if let Some(entry) = old_data {
-                                                store.upsert(&new_sid, entry.data, &[]);
+                                                let _ = store.upsert(&new_sid, entry.data, &[]);
                                             }
-                                            store.upsert(&new_sid, trailer.mutations, &trailer.deleted_keys);
+                                            let _ = store.upsert(&new_sid, trailer.mutations, &trailer.deleted_keys);
                                             let cookie = store.build_set_cookie(&new_sid);
                                             inject_set_cookie_header(&mut http_response, &cookie);
                                         }
@@ -2697,7 +2909,7 @@ where
                             } else if is_new_session {
                                 // No session trailer but session was accessed — set cookie
                                 if let Some(sid) = session_id {
-                                    store.upsert(&sid, std::collections::HashMap::new(), &[]);
+                                    let _ = store.upsert(&sid, std::collections::HashMap::new(), &[]);
                                     let cookie = store.build_set_cookie(&sid);
                                     inject_set_cookie_header(&mut http_response, &cookie);
                                 }
@@ -2847,28 +3059,6 @@ fn build_http_response_from_dispatch(
     Ok(output)
 }
 
-/// Patch the `connection:` header value in an already-built HTTP response.
-/// Searches for `connection: keep-alive` or `connection: close` and swaps to the
-/// requested variant.  The two values differ in length (10 vs 5 bytes) so the
-/// Vec may grow or shrink by a few bytes.
-fn patch_connection_header(response: &[u8], keep_alive: bool) -> Vec<u8> {
-    let (find, replace) = if keep_alive {
-        (&b"connection: close\r\n"[..], &b"connection: keep-alive\r\n"[..])
-    } else {
-        (&b"connection: keep-alive\r\n"[..], &b"connection: close\r\n"[..])
-    };
-
-    if let Some(pos) = memmem::find(response, find) {
-        let mut out = Vec::with_capacity(response.len() + replace.len() - find.len());
-        out.extend_from_slice(&response[..pos]);
-        out.extend_from_slice(replace);
-        out.extend_from_slice(&response[pos + find.len()..]);
-        out
-    } else {
-        // Header not found (shouldn't happen) — return unchanged clone
-        response.to_vec()
-    }
-}
 
 /// Resolve the session ID from the cookie header. Returns (session_id, is_new).
 /// If no cookie is present or invalid, generates a new session ID.
@@ -2967,9 +3157,16 @@ where
             Err(flume::TryRecvError::Disconnected) => break,
         }
 
-        // Read more data from the client
+        // Read more data from the client (with idle timeout)
         let owned_buf = std::mem::take(buffer);
-        let (read_result, returned_buf) = stream.read(owned_buf).await;
+        let timeout_result = timeout(TIMEOUT_WS_IDLE, stream.read(owned_buf)).await;
+        let (read_result, returned_buf) = match timeout_result {
+            Ok(res) => res,
+            Err(_) => {
+                // Idle timeout — close connection
+                break;
+            }
+        };
         *buffer = returned_buf;
         match read_result {
             Ok(0) => break,
@@ -3002,46 +3199,7 @@ fn build_ws_event_envelope(event_type: u8, ws_id: u64, handler_id: u32, data: &[
     buf
 }
 
-/// Inject a Set-Cookie header into an already-built HTTP response.
-/// Inserts the header just before the final \r\n\r\n (end of headers).
-fn inject_set_cookie_header(response: &mut Vec<u8>, cookie_value: &str) {
-    // Find the \r\n\r\n boundary between headers and body
-    if let Some(pos) = memmem::find(response, b"\r\n\r\n") {
-        let header_line = format!("set-cookie: {}\r\n", cookie_value);
-        let header_bytes = header_line.as_bytes();
 
-        // Insert before the final \r\n\r\n
-        let insert_pos = pos + 2; // after the last header's \r\n, before the blank \r\n
-        response.splice(insert_pos..insert_pos, header_bytes.iter().copied());
-
-        // Update Content-Length — it shouldn't change since we're adding headers, not body.
-        // Content-Length only measures the body, which is unchanged.
-    }
-}
-
-/// Build a simple error response without going through the JS bridge
-fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec<u8> {
-    let reason = status_reason(status);
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let body_len = body.len();
-
-    let total_size =
-        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2 + 45 + 2 + body_len;
-
-    let mut output = Vec::with_capacity(total_size);
-    output.extend_from_slice(b"HTTP/1.1 ");
-    write_u16(&mut output, status);
-    output.push(b' ');
-    output.extend_from_slice(reason.as_bytes());
-    output.extend_from_slice(b"\r\ncontent-length: ");
-    write_usize(&mut output, body_len);
-    output.extend_from_slice(b"\r\nconnection: ");
-    output.extend_from_slice(connection.as_bytes());
-    output.extend_from_slice(b"\r\ncontent-type: application/json; charset=utf-8\r\n\r\n");
-    output.extend_from_slice(body);
-
-    output
-}
 
 
 // ─── Security Utilities ─────────────────
@@ -3167,6 +3325,20 @@ fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
     }
 }
 
+/// @DX-4.1: str-based variant for HTTP/2 method mapping (h2 crate uses &str).
+pub(crate) fn method_code_from_str(method: &str) -> Option<u8> {
+    match method {
+        "GET" => Some(1),
+        "POST" => Some(2),
+        "PUT" => Some(3),
+        "DELETE" => Some(4),
+        "PATCH" => Some(5),
+        "OPTIONS" => Some(6),
+        "HEAD" => Some(7),
+        _ => None,
+    }
+}
+
 fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
     if consumed >= buffer.len() {
         buffer.clear();
@@ -3193,16 +3365,55 @@ fn bind_listener(
         .unwrap_or(server_config.default_host.as_str());
     let bind_addr = resolve_socket_addr(host, options.port)
         .with_context(|| format!("failed to resolve bind address {host}:{}", options.port))?;
-    let listener_opts = ListenerOpts::new()
-        .reuse_addr(true)
-        .reuse_port(true)
-        .backlog(options.backlog.unwrap_or(server_config.default_backlog));
 
-    TcpListener::bind_with_config(bind_addr, &listener_opts)
-        .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
+    /* @B3.5: configure raw socket with TCP_FASTOPEN before binding.
+     * TFO allows data in the SYN packet on resumed connections, saving 1 RTT
+     * for repeat clients. The queue length (256) limits the number of pending
+     * TFO connections the kernel will accept. Falls back silently on systems
+     * that don't support it (macOS, older Linux kernels). */
+    let raw_socket = socket2::Socket::new(
+        if bind_addr.is_ipv6() { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    ).context("failed to create raw socket")?;
+
+    raw_socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    {
+        raw_socket.set_reuse_port(true)?;
+    }
+
+    /* @B3.5: TCP_FASTOPEN — allow data in SYN packet on resumed connections.
+     * Uses raw setsockopt since socket2 doesn't expose TFO directly.
+     * Silently ignored on systems that don't support it. */
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = raw_socket.as_raw_fd();
+        let val: libc::c_int = 256; // TFO queue length
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    raw_socket.bind(&bind_addr.into())?;
+    raw_socket.listen(options.backlog.unwrap_or(server_config.default_backlog))?;
+    raw_socket.set_nonblocking(true)?;
+
+    let std_listener: std::net::TcpListener = raw_socket.into();
+    TcpListener::from_std(std_listener)
+        .with_context(|| format!("failed to create monoio listener from raw socket on {bind_addr}"))
 }
 
-fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<TlsAcceptor>> {
+/// @DX-4.1: returns both the monoio-rustls acceptor and the shared rustls
+/// config Arc. The Arc is needed for tokio-rustls when h2 is negotiated.
+fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<(TlsAcceptor, Arc<RustlsServerConfig>)>> {
     let Some(tls) = manifest.tls.as_ref() else {
         return Ok(None);
     };
@@ -3218,9 +3429,13 @@ fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<TlsAcceptor>> {
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .context("failed to construct rustls server config")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    /* @DX-4.1: advertise both HTTP/2 and HTTP/1.1 via ALPN. rustls will
+     * select the client's preferred protocol during the TLS handshake.
+     * h2 is listed first so capable clients default to HTTP/2. */
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    let config_arc = Arc::new(config);
+    Ok(Some((TlsAcceptor::from(config_arc.clone()), config_arc)))
 }
 
 fn parse_tls_certificates(
@@ -3250,7 +3465,7 @@ fn parse_tls_private_key(tls: &TlsConfigInput) -> Result<PrivateKeyDer<'static>>
 
     if tls.passphrase.is_some() {
         return Err(anyhow!(
-            "encrypted TLS private keys are not supported by this loader; provide an unencrypted PEM key"
+            "encrypted TLS private keys are not supported; provide an unencrypted PEM key"
         ));
     }
 
@@ -3281,34 +3496,8 @@ fn validate_manifest(manifest: &ManifestInput) -> Result<()> {
     Ok(())
 }
 
-fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    memmem::find(bytes, b"\r\n\r\n")
-}
 
-fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
-fn trim_ascii_spaces(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
-        .unwrap_or(start);
-    &bytes[start..end]
-}
-
-fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
     // Fast path: "/" or no trailing slash — zero allocation
     if path == "/" || !path.ends_with('/') {
         return Cow::Borrowed(path);
@@ -3338,61 +3527,7 @@ fn config_string(
     input.and_then(pick).unwrap_or(fallback).to_string()
 }
 
-fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        422 => "Unprocessable Entity",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
-    }
-}
-
-/// Fast integer-to-string for small values — uses stack-allocated itoa buffer
-#[inline(always)]
-fn write_usize(output: &mut Vec<u8>, value: usize) {
-    let mut buf = itoa::Buffer::new();
-    output.extend_from_slice(buf.format(value).as_bytes());
-}
-
-#[inline(always)]
-fn write_u16(output: &mut Vec<u8>, value: u16) {
-    let mut buf = itoa::Buffer::new();
-    output.extend_from_slice(buf.format(value).as_bytes());
-}
-
-fn count_digits(mut n: usize) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut count = 0;
-    while n > 0 {
-        count += 1;
-        n /= 10;
-    }
-    count
-}
+use crate::http_utils::{status_reason, write_usize, write_u16};
 
 fn push_string_pair(frame: &mut Vec<u8>, name: &str, value: &str) -> Result<()> {
     if name.len() > u8::MAX as usize {

@@ -67,18 +67,12 @@ function parseForwardedFor(value) {
 }
 
 function defaultRequestKey(req) {
+  /* Use the peer IP from the native connection — this cannot be spoofed.
+   * Only fall back to proxy headers if req.ip is unavailable (e.g., tests).
+   * Users behind a reverse proxy should provide a custom `key` function
+   * that extracts the real IP from trusted proxy headers. */
   if (typeof req?.ip === "string" && req.ip.trim() !== "") {
     return req.ip.trim();
-  }
-
-  const forwarded = parseForwardedFor(getHeader(req, "x-forwarded-for"));
-  if (forwarded) {
-    return forwarded;
-  }
-
-  const realIp = getHeader(req, "x-real-ip");
-  if (realIp) {
-    return realIp.trim();
   }
 
   return "unknown";

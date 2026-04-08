@@ -108,6 +108,11 @@ pub struct RouteInput {
     pub cache: Option<CacheConfigInput>,
     #[serde(default)]
     pub static_response: Option<StaticResponseInput>,
+    /// @DX-3.4: per-route maximum request body size in bytes. Overrides the
+    /// global MAX_BODY_BYTES constant when set. Enforced in Rust before the
+    /// full body is read into memory.
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

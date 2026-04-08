@@ -319,6 +319,7 @@ async function main() {
     serverConfig: {
       ...httpServerConfig,
       maxHeaderBytes: httpServerConfig.maxHeaderBytes,
+      tls: null,
     },
   });
   let closed = false;

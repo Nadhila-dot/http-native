@@ -4,6 +4,9 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NAMESPACE_SEPARATOR: char = '\u{1f}';
+const MAX_RATE_LIMIT_ENTRIES: usize = 100_000;
+const EVICTION_TARGET_RATIO: f64 = 0.8;
+const EVICT_STALE_THRESHOLD_MS: u64 = 3_600_000; // 1 hour
 
 #[derive(Debug, Clone)]
 pub struct RateLimitDecision {
@@ -88,6 +91,40 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn maybe_evict(map: &DashMap<String, SlidingWindowState>, now_ms: u64) {
+    if map.len() <= MAX_RATE_LIMIT_ENTRIES {
+        return;
+    }
+
+    let target = (MAX_RATE_LIMIT_ENTRIES as f64 * EVICTION_TARGET_RATIO) as usize;
+
+    // First pass: remove stale entries (not seen in over 1 hour)
+    let stale_keys: Vec<String> = map
+        .iter()
+        .filter(|entry| now_ms.saturating_sub(entry.value().last_seen_ms) > EVICT_STALE_THRESHOLD_MS)
+        .map(|entry| entry.key().clone())
+        .collect();
+    for key in &stale_keys {
+        map.remove(key);
+    }
+
+    if map.len() <= target {
+        return;
+    }
+
+    // Second pass: evict oldest entries by last_seen_ms
+    let mut entries: Vec<(String, u64)> = map
+        .iter()
+        .map(|e| (e.key().clone(), e.value().last_seen_ms))
+        .collect();
+    entries.sort_by_key(|(_, ts)| *ts);
+
+    let to_evict = map.len().saturating_sub(target);
+    for (key, _) in entries.into_iter().take(to_evict) {
+        map.remove(&key);
+    }
+}
+
 pub fn check(
     namespace: &str,
     key: &str,
@@ -126,6 +163,8 @@ pub fn check(
     if should_collect {
         let _ = map.remove(&compound);
     }
+
+    maybe_evict(map, now_ms);
 
     RateLimitDecision {
         allowed,

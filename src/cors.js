@@ -70,7 +70,14 @@ export function cors(options = {}) {
     }
 
     if (effectiveOrigin !== "*") {
-      res.set("Vary", "Origin");
+      const existing = res.get("vary");
+      if (existing) {
+        if (!existing.toLowerCase().includes("origin")) {
+          res.set("vary", `${existing}, Origin`);
+        }
+      } else {
+        res.set("vary", "Origin");
+      }
     }
 
     if (exposedHeadersString) {

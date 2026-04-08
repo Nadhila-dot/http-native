@@ -95,7 +95,7 @@ export function normalizeHttpServerConfig(overrides = {}) {
       overrides.headerTransferEncodingPrefix ??
         httpServerConfig.headerTransferEncodingPrefix,
     ),
-    tls: normalizeTlsConfig(overrides.tls ?? httpServerConfig.tls),
+    tls: normalizeTlsConfig("tls" in overrides ? overrides.tls : httpServerConfig.tls),
   };
 }
 
